@@ -1,6 +1,23 @@
 # Automotive Body Control Module (BCM)
 
-A production-grade Body Control Module implementation written in C11. Features message-driven architecture with explicit state machines, CAN bus communication, and comprehensive testing.
+[![C11](https://img.shields.io/badge/C-11-blue.svg)](https://en.cppreference.com/w/c/11)
+[![CMake](https://img.shields.io/badge/CMake-3.16+-green.svg)](https://cmake.org/)
+[![License](https://img.shields.io/badge/License-Proprietary-red.svg)]()
+
+## About
+
+A production-grade **Body Control Module (BCM)** implementation for automotive systems, written in **C11** with a focus on embedded best practices. This project demonstrates expertise in:
+
+- **Embedded Systems Design** — Message-driven architecture with deterministic timing
+- **Automotive Protocols** — CAN bus communication with proper frame validation
+- **State Machine Implementation** — Explicit FSMs for door, lighting, and turn signal control
+- **Defensive Programming** — Input validation, checksums, rolling counters, fault management
+- **Testing Methodology** — Unit tests (CppUTest), Software-in-the-Loop (SIL) simulation
+- **Zero Dynamic Allocation** — All memory statically allocated (~1.6KB RAM footprint)
+
+> *Built as a portfolio project showcasing automotive embedded software development skills.*
+
+---
 
 ## Features
 
@@ -258,6 +275,21 @@ python3 tools/can_simulator.py -s all  # All scenarios
 - **Defensive coding** - All inputs validated
 - **C11 standard** - No compiler extensions
 - **Embedded-friendly** - ~1.6KB RAM footprint
+
+## Technologies
+
+| Category | Technologies |
+|----------|--------------|
+| Language | C11 |
+| Build | CMake 3.16+ |
+| Testing | CppUTest, CTest |
+| Protocol | CAN 2.0A (11-bit IDs) |
+| SIL | Linux SocketCAN, vcan |
+| Tools | Python 3, python-can |
+
+## Author
+
+Developed as a demonstration of automotive embedded software engineering skills.
 
 ## License
 

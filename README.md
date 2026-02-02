@@ -32,14 +32,14 @@ A production-grade **Body Control Module (BCM)** implementation for automotive s
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Door Control    Lighting    Turn Signal   Fault   │
-│  State Machine   State M/C   State M/C     Manager │
+│  Door Control    Lighting    Turn Signal   Fault    │
+│  State Machine   State M/C   State M/C     Manager  │
 ├─────────────────────────────────────────────────────┤
 │                    BCM Core                         │
 │         Message routing, periodic scheduler         │
 ├─────────────────────────────────────────────────────┤
 │              CAN Interface Layer                    │
-│     BCM_SIL=1: SocketCAN | BCM_SIL=0: Stub         │
+│     BCM_SIL=1: SocketCAN | BCM_SIL=0: Stub          │
 └─────────────────────────────────────────────────────┘
 ```
 

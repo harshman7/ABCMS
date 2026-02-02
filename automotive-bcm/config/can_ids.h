@@ -1,16 +1,13 @@
 /**
  * @file can_ids.h
- * @brief CAN Message ID Definitions for Body Control Module
+ * @brief CAN Message Schema for Body Control Module
+ * @version 1.0.0
  *
- * This file contains all CAN message identifiers used by the BCM.
- * IDs follow standard automotive CAN 2.0B conventions.
- *
- * CAN ID Structure (11-bit standard):
- *   Bits 10-8: Priority (0=highest, 7=lowest)
- *   Bits 7-4:  Source ECU ID
- *   Bits 3-0:  Message Type
- *
- * @note Modify these values according to your vehicle network specification
+ * This file defines the complete CAN message schema including:
+ * - 11-bit standard CAN IDs
+ * - Precise byte layouts for all messages
+ * - Enum values and valid ranges
+ * - Rolling counter and checksum definitions
  */
 
 #ifndef CAN_IDS_H
@@ -20,145 +17,469 @@
 extern "C" {
 #endif
 
-/* =============================================================================
- * CAN Network Configuration
- * ========================================================================== */
+#include <stdint.h>
 
-/** CAN bus baud rate in bits per second */
-#define CAN_BAUD_RATE           500000U
+/*******************************************************************************
+ * CAN Configuration
+ ******************************************************************************/
 
-/** Maximum CAN payload size (standard CAN) */
-#define CAN_MAX_DATA_LEN        8U
+#define CAN_BAUD_RATE               500000U
+#define CAN_MAX_DLC                 8U
+#define CAN_SCHEMA_VERSION          0x01U
 
-/* =============================================================================
- * BCM Transmit Message IDs (Messages sent by BCM)
- * ========================================================================== */
+/* Rolling counter configuration */
+#define CAN_COUNTER_MAX             15U
+#define CAN_COUNTER_MASK            0x0FU
 
-/** BCM Status broadcast message */
-#define CAN_ID_BCM_STATUS               0x200U
+/* Checksum: XOR of all payload bytes except checksum byte itself */
+#define CAN_CHECKSUM_SEED           0xAAU
 
-/** Door status message (locks, windows, positions) */
-#define CAN_ID_DOOR_STATUS              0x210U
+/*******************************************************************************
+ * CAN Message IDs - RX (Commands to BCM)
+ ******************************************************************************/
 
-/** Lighting status message (all lights) */
-#define CAN_ID_LIGHTING_STATUS          0x220U
+#define CAN_ID_DOOR_CMD             0x100U  /**< Door lock/unlock commands */
+#define CAN_ID_LIGHTING_CMD         0x110U  /**< Lighting control commands */
+#define CAN_ID_TURN_SIGNAL_CMD      0x120U  /**< Turn signal/hazard commands */
+#define CAN_ID_BCM_CONFIG           0x130U  /**< BCM configuration */
 
-/** Turn signal status message */
-#define CAN_ID_TURN_SIGNAL_STATUS       0x230U
+/*******************************************************************************
+ * CAN Message IDs - TX (Status from BCM)
+ ******************************************************************************/
 
-/** BCM fault/diagnostic message */
-#define CAN_ID_BCM_FAULT                0x240U
+#define CAN_ID_DOOR_STATUS          0x200U  /**< Door state status */
+#define CAN_ID_LIGHTING_STATUS      0x210U  /**< Lighting state status */
+#define CAN_ID_TURN_SIGNAL_STATUS   0x220U  /**< Turn signal state status */
+#define CAN_ID_FAULT_STATUS         0x230U  /**< Fault status */
+#define CAN_ID_BCM_HEARTBEAT        0x240U  /**< BCM heartbeat/alive */
 
-/** BCM heartbeat (alive signal) */
-#define CAN_ID_BCM_HEARTBEAT            0x250U
+/*******************************************************************************
+ * DOOR_CMD (0x100) - Door Lock/Unlock Command
+ * DLC: 4 bytes
+ * 
+ * Byte 0: Command
+ *   0x01 = Lock all doors
+ *   0x02 = Unlock all doors
+ *   0x03 = Lock single door (door ID in byte 1)
+ *   0x04 = Unlock single door (door ID in byte 1)
+ * 
+ * Byte 1: Door ID (for single door commands)
+ *   0x00 = Front Left (Driver)
+ *   0x01 = Front Right (Passenger)
+ *   0x02 = Rear Left
+ *   0x03 = Rear Right
+ *   0xFF = All doors (for lock/unlock all)
+ * 
+ * Byte 2: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 3: Checksum (XOR of bytes 0-2 with seed 0xAA)
+ ******************************************************************************/
 
-/* =============================================================================
- * BCM Receive Message IDs (Commands received by BCM)
- * ========================================================================== */
+#define DOOR_CMD_DLC                4U
 
-/** Door control commands */
-#define CAN_ID_DOOR_CMD                 0x300U
+/* Door command values */
+typedef enum {
+    DOOR_CMD_LOCK_ALL       = 0x01,
+    DOOR_CMD_UNLOCK_ALL     = 0x02,
+    DOOR_CMD_LOCK_SINGLE    = 0x03,
+    DOOR_CMD_UNLOCK_SINGLE  = 0x04,
+    DOOR_CMD_MAX            = 0x04
+} door_cmd_t;
 
-/** Lighting control commands */
-#define CAN_ID_LIGHTING_CMD             0x310U
+/* Door ID values */
+typedef enum {
+    DOOR_ID_FRONT_LEFT      = 0x00,
+    DOOR_ID_FRONT_RIGHT     = 0x01,
+    DOOR_ID_REAR_LEFT       = 0x02,
+    DOOR_ID_REAR_RIGHT      = 0x03,
+    DOOR_ID_ALL             = 0xFF,
+    DOOR_ID_MAX             = 0x03
+} door_id_t;
 
-/** Turn signal control commands */
-#define CAN_ID_TURN_SIGNAL_CMD          0x320U
+#define DOOR_CMD_BYTE_CMD           0
+#define DOOR_CMD_BYTE_DOOR_ID       1
+#define DOOR_CMD_BYTE_VER_CTR       2
+#define DOOR_CMD_BYTE_CHECKSUM      3
 
-/** BCM configuration commands */
-#define CAN_ID_BCM_CONFIG_CMD           0x330U
+/*******************************************************************************
+ * LIGHTING_CMD (0x110) - Lighting Control Command
+ * DLC: 4 bytes
+ * 
+ * Byte 0: Headlight Mode Command
+ *   0x00 = Off
+ *   0x01 = On (low beam)
+ *   0x02 = Auto (ambient sensor controlled)
+ *   0x03 = High beam on
+ *   0x04 = High beam off
+ * 
+ * Byte 1: Interior Light Command
+ *   0x00 = Off
+ *   0x01 = On
+ *   0x02 = Auto (door triggered)
+ *   [7:4] = Reserved
+ *   [3:0] = Brightness (0-15) when On
+ * 
+ * Byte 2: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 3: Checksum (XOR of bytes 0-2 with seed 0xAA)
+ ******************************************************************************/
 
-/** Diagnostic request message */
-#define CAN_ID_DIAG_REQUEST             0x7DFU
+#define LIGHTING_CMD_DLC            4U
 
-/** BCM-specific diagnostic request */
-#define CAN_ID_BCM_DIAG_REQUEST         0x720U
+/* Headlight mode values */
+typedef enum {
+    HEADLIGHT_CMD_OFF       = 0x00,
+    HEADLIGHT_CMD_ON        = 0x01,
+    HEADLIGHT_CMD_AUTO      = 0x02,
+    HEADLIGHT_CMD_HIGH_ON   = 0x03,
+    HEADLIGHT_CMD_HIGH_OFF  = 0x04,
+    HEADLIGHT_CMD_MAX       = 0x04
+} headlight_cmd_t;
 
-/* =============================================================================
- * External ECU Message IDs (Messages from other modules)
- * ========================================================================== */
+/* Interior light mode values */
+typedef enum {
+    INTERIOR_CMD_OFF        = 0x00,
+    INTERIOR_CMD_ON         = 0x01,
+    INTERIOR_CMD_AUTO       = 0x02,
+    INTERIOR_CMD_MAX        = 0x02
+} interior_cmd_t;
 
-/** Ignition status from Body Computer */
-#define CAN_ID_IGNITION_STATUS          0x100U
+#define LIGHTING_CMD_BYTE_HEADLIGHT     0
+#define LIGHTING_CMD_BYTE_INTERIOR      1
+#define LIGHTING_CMD_BYTE_VER_CTR       2
+#define LIGHTING_CMD_BYTE_CHECKSUM      3
 
-/** Vehicle speed from ABS/ESP */
-#define CAN_ID_VEHICLE_SPEED            0x110U
+#define INTERIOR_BRIGHTNESS_MASK        0x0FU
+#define INTERIOR_MODE_MASK              0x03U
 
-/** Engine status from ECM */
-#define CAN_ID_ENGINE_STATUS            0x120U
+/*******************************************************************************
+ * TURN_SIGNAL_CMD (0x120) - Turn Signal/Hazard Command
+ * DLC: 4 bytes
+ * 
+ * Byte 0: Turn Signal Command
+ *   0x00 = All off
+ *   0x01 = Left signal on
+ *   0x02 = Right signal on
+ *   0x03 = Hazard on
+ *   0x04 = Hazard off
+ * 
+ * Byte 1: Reserved (0x00)
+ * 
+ * Byte 2: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 3: Checksum (XOR of bytes 0-2 with seed 0xAA)
+ ******************************************************************************/
 
-/** Key fob commands (from PEPS/RKE module) */
-#define CAN_ID_KEYFOB_CMD               0x130U
+#define TURN_SIGNAL_CMD_DLC         4U
 
-/** Ambient light sensor data */
-#define CAN_ID_AMBIENT_LIGHT            0x140U
+/* Turn signal command values */
+typedef enum {
+    TURN_CMD_OFF            = 0x00,
+    TURN_CMD_LEFT_ON        = 0x01,
+    TURN_CMD_RIGHT_ON       = 0x02,
+    TURN_CMD_HAZARD_ON      = 0x03,
+    TURN_CMD_HAZARD_OFF     = 0x04,
+    TURN_CMD_MAX            = 0x04
+} turn_cmd_t;
 
-/** Rain sensor data */
-#define CAN_ID_RAIN_SENSOR              0x150U
+#define TURN_CMD_BYTE_CMD           0
+#define TURN_CMD_BYTE_RESERVED      1
+#define TURN_CMD_BYTE_VER_CTR       2
+#define TURN_CMD_BYTE_CHECKSUM      3
 
-/* =============================================================================
- * Diagnostic Message IDs (UDS/OBD-II)
- * ========================================================================== */
+/*******************************************************************************
+ * DOOR_STATUS (0x200) - Door State Status
+ * DLC: 6 bytes
+ * TX Period: 100ms
+ * 
+ * Byte 0: Door Lock States (bitfield)
+ *   Bit 0 = Front Left locked (1=locked, 0=unlocked)
+ *   Bit 1 = Front Right locked
+ *   Bit 2 = Rear Left locked
+ *   Bit 3 = Rear Right locked
+ *   Bits 4-7 = Reserved
+ * 
+ * Byte 1: Door Open States (bitfield)
+ *   Bit 0 = Front Left open (1=open, 0=closed)
+ *   Bit 1 = Front Right open
+ *   Bit 2 = Rear Left open
+ *   Bit 3 = Rear Right open
+ *   Bits 4-7 = Reserved
+ * 
+ * Byte 2: Last Command Result
+ *   0x00 = OK
+ *   0x01 = Invalid command
+ *   0x02 = Checksum error
+ *   0x03 = Counter error
+ *   0x04 = Timeout
+ * 
+ * Byte 3: Active Fault Count (0-255)
+ * 
+ * Byte 4: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 5: Checksum (XOR of bytes 0-4 with seed 0xAA)
+ ******************************************************************************/
 
-/** BCM diagnostic response */
-#define CAN_ID_BCM_DIAG_RESPONSE        0x728U
+#define DOOR_STATUS_DLC             6U
+#define DOOR_STATUS_PERIOD_MS       100U
 
-/** Functional diagnostic response (broadcast) */
-#define CAN_ID_DIAG_RESPONSE            0x7E8U
+/* Door lock state bit positions */
+#define DOOR_LOCK_BIT_FL            0x01U
+#define DOOR_LOCK_BIT_FR            0x02U
+#define DOOR_LOCK_BIT_RL            0x04U
+#define DOOR_LOCK_BIT_RR            0x08U
 
-/* =============================================================================
- * Message ID Masks and Filters
- * ========================================================================== */
+/* Door open state bit positions */
+#define DOOR_OPEN_BIT_FL            0x01U
+#define DOOR_OPEN_BIT_FR            0x02U
+#define DOOR_OPEN_BIT_RL            0x04U
+#define DOOR_OPEN_BIT_RR            0x08U
 
-/** Mask for BCM transmit messages */
-#define CAN_MASK_BCM_TX                 0x7F0U
+/* Command result values */
+typedef enum {
+    CMD_RESULT_OK               = 0x00,
+    CMD_RESULT_INVALID_CMD      = 0x01,
+    CMD_RESULT_CHECKSUM_ERROR   = 0x02,
+    CMD_RESULT_COUNTER_ERROR    = 0x03,
+    CMD_RESULT_TIMEOUT          = 0x04
+} cmd_result_t;
 
-/** Mask for BCM receive messages */
-#define CAN_MASK_BCM_RX                 0x7F0U
+#define DOOR_STATUS_BYTE_LOCKS      0
+#define DOOR_STATUS_BYTE_OPENS      1
+#define DOOR_STATUS_BYTE_RESULT     2
+#define DOOR_STATUS_BYTE_FAULTS     3
+#define DOOR_STATUS_BYTE_VER_CTR    4
+#define DOOR_STATUS_BYTE_CHECKSUM   5
 
-/** Mask for diagnostic messages */
-#define CAN_MASK_DIAG                   0x700U
+/*******************************************************************************
+ * LIGHTING_STATUS (0x210) - Lighting State Status
+ * DLC: 6 bytes
+ * TX Period: 100ms
+ * 
+ * Byte 0: Headlight State
+ *   0x00 = Off
+ *   0x01 = On (low beam)
+ *   0x02 = Auto mode active
+ *   0x03 = High beam active
+ * 
+ * Byte 1: Interior Light State
+ *   [1:0] Mode (0=off, 1=on, 2=auto)
+ *   [5:2] Brightness (0-15)
+ *   [7:6] Reserved
+ * 
+ * Byte 2: Ambient Light Level (0-255, scaled lux/10)
+ * 
+ * Byte 3: Last Command Result (same enum as door)
+ * 
+ * Byte 4: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 5: Checksum (XOR of bytes 0-4 with seed 0xAA)
+ ******************************************************************************/
 
-/* =============================================================================
- * Message Data Field Definitions
- * ========================================================================== */
+#define LIGHTING_STATUS_DLC         6U
+#define LIGHTING_STATUS_PERIOD_MS   100U
 
-/* Door Command Message (CAN_ID_DOOR_CMD) Byte 0 */
-#define DOOR_CMD_LOCK_ALL               0x01U
-#define DOOR_CMD_UNLOCK_ALL             0x02U
-#define DOOR_CMD_LOCK_SINGLE            0x03U
-#define DOOR_CMD_UNLOCK_SINGLE          0x04U
-#define DOOR_CMD_WINDOW_UP              0x10U
-#define DOOR_CMD_WINDOW_DOWN            0x11U
-#define DOOR_CMD_WINDOW_STOP            0x12U
-#define DOOR_CMD_CHILD_LOCK_ON          0x20U
-#define DOOR_CMD_CHILD_LOCK_OFF         0x21U
+/* Headlight state values */
+typedef enum {
+    HEADLIGHT_STATE_OFF         = 0x00,
+    HEADLIGHT_STATE_ON          = 0x01,
+    HEADLIGHT_STATE_AUTO        = 0x02,
+    HEADLIGHT_STATE_HIGH_BEAM   = 0x03
+} headlight_state_t;
 
-/* Lighting Command Message (CAN_ID_LIGHTING_CMD) Byte 0 */
-#define LIGHT_CMD_HEADLIGHTS_ON         0x01U
-#define LIGHT_CMD_HEADLIGHTS_OFF        0x02U
-#define LIGHT_CMD_HEADLIGHTS_AUTO       0x03U
-#define LIGHT_CMD_HIGH_BEAM_ON          0x10U
-#define LIGHT_CMD_HIGH_BEAM_OFF         0x11U
-#define LIGHT_CMD_FOG_LIGHTS_ON         0x20U
-#define LIGHT_CMD_FOG_LIGHTS_OFF        0x21U
-#define LIGHT_CMD_INTERIOR_ON           0x30U
-#define LIGHT_CMD_INTERIOR_OFF          0x31U
-#define LIGHT_CMD_INTERIOR_DIM          0x32U
+/* Interior light state masks */
+#define INTERIOR_STATE_MODE_MASK        0x03U
+#define INTERIOR_STATE_BRIGHTNESS_MASK  0x3CU
+#define INTERIOR_STATE_BRIGHTNESS_SHIFT 2U
 
-/* Turn Signal Command Message (CAN_ID_TURN_SIGNAL_CMD) Byte 0 */
-#define TURN_CMD_LEFT_ON                0x01U
-#define TURN_CMD_LEFT_OFF               0x02U
-#define TURN_CMD_RIGHT_ON               0x03U
-#define TURN_CMD_RIGHT_OFF              0x04U
-#define TURN_CMD_HAZARD_ON              0x10U
-#define TURN_CMD_HAZARD_OFF             0x11U
+#define LIGHTING_STATUS_BYTE_HEADLIGHT  0
+#define LIGHTING_STATUS_BYTE_INTERIOR   1
+#define LIGHTING_STATUS_BYTE_AMBIENT    2
+#define LIGHTING_STATUS_BYTE_RESULT     3
+#define LIGHTING_STATUS_BYTE_VER_CTR    4
+#define LIGHTING_STATUS_BYTE_CHECKSUM   5
 
-/* Ignition Status Message (CAN_ID_IGNITION_STATUS) Byte 0 */
-#define IGN_STATUS_OFF                  0x00U
-#define IGN_STATUS_ACC                  0x01U
-#define IGN_STATUS_ON                   0x02U
-#define IGN_STATUS_START                0x03U
+/*******************************************************************************
+ * TURN_SIGNAL_STATUS (0x220) - Turn Signal State Status
+ * DLC: 6 bytes
+ * TX Period: 100ms
+ * 
+ * Byte 0: Turn Signal State
+ *   0x00 = All off
+ *   0x01 = Left active
+ *   0x02 = Right active
+ *   0x03 = Hazard active
+ * 
+ * Byte 1: Output State
+ *   Bit 0 = Left lamp on (current flash state)
+ *   Bit 1 = Right lamp on (current flash state)
+ *   Bits 2-7 = Reserved
+ * 
+ * Byte 2: Flash Count (0-255, wraps)
+ * 
+ * Byte 3: Last Command Result
+ * 
+ * Byte 4: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 5: Checksum (XOR of bytes 0-4 with seed 0xAA)
+ ******************************************************************************/
+
+#define TURN_SIGNAL_STATUS_DLC          6U
+#define TURN_SIGNAL_STATUS_PERIOD_MS    100U
+
+/* Turn signal state values */
+typedef enum {
+    TURN_STATE_OFF              = 0x00,
+    TURN_STATE_LEFT             = 0x01,
+    TURN_STATE_RIGHT            = 0x02,
+    TURN_STATE_HAZARD           = 0x03
+} turn_state_t;
+
+/* Output state bit positions */
+#define TURN_OUTPUT_LEFT_BIT            0x01U
+#define TURN_OUTPUT_RIGHT_BIT           0x02U
+
+#define TURN_STATUS_BYTE_STATE          0
+#define TURN_STATUS_BYTE_OUTPUT         1
+#define TURN_STATUS_BYTE_FLASH_CNT      2
+#define TURN_STATUS_BYTE_RESULT         3
+#define TURN_STATUS_BYTE_VER_CTR        4
+#define TURN_STATUS_BYTE_CHECKSUM       5
+
+/*******************************************************************************
+ * FAULT_STATUS (0x230) - Fault Status
+ * DLC: 8 bytes
+ * TX Period: 500ms (or on change)
+ * 
+ * Byte 0: Active Fault Flags 1
+ *   Bit 0 = Door lock motor fault
+ *   Bit 1 = Headlight bulb fault
+ *   Bit 2 = Turn signal bulb fault
+ *   Bit 3 = CAN communication fault
+ *   Bit 4 = Command checksum fault
+ *   Bit 5 = Command counter fault
+ *   Bit 6 = Timeout fault
+ *   Bit 7 = Reserved
+ * 
+ * Byte 1: Active Fault Flags 2 (reserved for expansion)
+ * 
+ * Byte 2: Total Fault Count (0-255)
+ * 
+ * Byte 3: Most Recent Fault Code (0-255)
+ * 
+ * Byte 4: Fault Timestamp High (seconds since boot, high byte)
+ * 
+ * Byte 5: Fault Timestamp Low (seconds since boot, low byte)
+ * 
+ * Byte 6: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 7: Checksum (XOR of bytes 0-6 with seed 0xAA)
+ ******************************************************************************/
+
+#define FAULT_STATUS_DLC                8U
+#define FAULT_STATUS_PERIOD_MS          500U
+
+/* Fault flag bit positions */
+#define FAULT_BIT_DOOR_MOTOR            0x01U
+#define FAULT_BIT_HEADLIGHT_BULB        0x02U
+#define FAULT_BIT_TURN_BULB             0x04U
+#define FAULT_BIT_CAN_COMM              0x08U
+#define FAULT_BIT_CMD_CHECKSUM          0x10U
+#define FAULT_BIT_CMD_COUNTER           0x20U
+#define FAULT_BIT_TIMEOUT               0x40U
+
+/* Fault codes */
+typedef enum {
+    FAULT_CODE_NONE                 = 0x00,
+    FAULT_CODE_DOOR_MOTOR           = 0x01,
+    FAULT_CODE_HEADLIGHT_BULB       = 0x02,
+    FAULT_CODE_TURN_BULB            = 0x03,
+    FAULT_CODE_CAN_COMM             = 0x10,
+    FAULT_CODE_INVALID_CHECKSUM     = 0x20,
+    FAULT_CODE_INVALID_COUNTER      = 0x21,
+    FAULT_CODE_INVALID_CMD          = 0x22,
+    FAULT_CODE_INVALID_LENGTH       = 0x23,
+    FAULT_CODE_TIMEOUT              = 0x30
+} fault_code_t;
+
+#define FAULT_STATUS_BYTE_FLAGS1        0
+#define FAULT_STATUS_BYTE_FLAGS2        1
+#define FAULT_STATUS_BYTE_COUNT         2
+#define FAULT_STATUS_BYTE_RECENT_CODE   3
+#define FAULT_STATUS_BYTE_TS_HIGH       4
+#define FAULT_STATUS_BYTE_TS_LOW        5
+#define FAULT_STATUS_BYTE_VER_CTR       6
+#define FAULT_STATUS_BYTE_CHECKSUM      7
+
+/*******************************************************************************
+ * BCM_HEARTBEAT (0x240) - BCM Alive/Heartbeat
+ * DLC: 4 bytes
+ * TX Period: 1000ms
+ * 
+ * Byte 0: BCM State
+ *   0x00 = Init
+ *   0x01 = Normal
+ *   0x02 = Fault
+ *   0x03 = Diagnostic
+ * 
+ * Byte 1: Uptime (minutes, 0-255, wraps)
+ * 
+ * Byte 2: [7:4] Version, [3:0] Rolling Counter (0-15)
+ * 
+ * Byte 3: Checksum (XOR of bytes 0-2 with seed 0xAA)
+ ******************************************************************************/
+
+#define BCM_HEARTBEAT_DLC               4U
+#define BCM_HEARTBEAT_PERIOD_MS         1000U
+
+/* BCM state values */
+typedef enum {
+    BCM_STATE_INIT          = 0x00,
+    BCM_STATE_NORMAL        = 0x01,
+    BCM_STATE_FAULT         = 0x02,
+    BCM_STATE_DIAGNOSTIC    = 0x03
+} bcm_state_t;
+
+#define HEARTBEAT_BYTE_STATE            0
+#define HEARTBEAT_BYTE_UPTIME           1
+#define HEARTBEAT_BYTE_VER_CTR          2
+#define HEARTBEAT_BYTE_CHECKSUM         3
+
+/*******************************************************************************
+ * Utility Macros
+ ******************************************************************************/
+
+/** Build version/counter byte: [7:4]=version, [3:0]=counter */
+#define CAN_BUILD_VER_CTR(ver, ctr)     (((uint8_t)(ver) << 4) | ((uint8_t)(ctr) & CAN_COUNTER_MASK))
+
+/** Extract version from ver/ctr byte */
+#define CAN_GET_VERSION(byte)           (((byte) >> 4) & 0x0FU)
+
+/** Extract counter from ver/ctr byte */
+#define CAN_GET_COUNTER(byte)           ((byte) & CAN_COUNTER_MASK)
+
+/** Calculate XOR checksum with seed */
+static inline uint8_t can_calculate_checksum(const uint8_t *data, uint8_t len)
+{
+    uint8_t checksum = CAN_CHECKSUM_SEED;
+    for (uint8_t i = 0; i < len; i++) {
+        checksum ^= data[i];
+    }
+    return checksum;
+}
+
+/** Validate checksum: returns true if valid */
+static inline int can_validate_checksum(const uint8_t *data, uint8_t len, uint8_t received_checksum)
+{
+    return (can_calculate_checksum(data, len) == received_checksum);
+}
+
+/** Validate rolling counter: returns true if valid (expected = last + 1, with wrap) */
+static inline int can_validate_counter(uint8_t received, uint8_t last)
+{
+    uint8_t expected = (last + 1) & CAN_COUNTER_MASK;
+    return (received == expected);
+}
 
 #ifdef __cplusplus
 }

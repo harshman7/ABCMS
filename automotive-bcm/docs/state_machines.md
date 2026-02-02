@@ -1,436 +1,321 @@
 # BCM State Machines
 
-This document describes the state machines implemented in the Body Control Module.
+This document describes the state machines implemented in each BCM module.
 
-## BCM System State Machine
+## Door Control State Machine
 
-The main BCM system operates in the following states:
+Each door has an independent lock state machine.
+
+### States
+
+| State | Value | Description |
+|-------|-------|-------------|
+| UNLOCKED | 0 | Door is unlocked |
+| LOCKED | 1 | Door is locked |
+| LOCKING | 2 | Lock actuator moving to lock |
+| UNLOCKING | 3 | Lock actuator moving to unlock |
+
+### State Diagram
 
 ```
-                    ┌─────────────────┐
-                    │                 │
-        ┌───────────│      INIT       │
-        │           │                 │
-        │           └────────┬────────┘
-        │                    │ Initialization
-        │                    │ Complete
-        │                    ▼
-        │           ┌─────────────────┐
-        │    ┌──────│                 │◄─────────────┐
-        │    │      │     NORMAL      │              │
-        │    │      │                 │──────┐       │
-        │    │      └────────┬────────┘      │       │
-        │    │               │               │       │
-        │    │ Sleep         │ Critical      │       │
-        │    │ Request       │ Fault         │ Diag  │
-        │    ▼               ▼               │ Mode  │
-        │  ┌─────────┐  ┌─────────────┐      │       │
-        │  │  SLEEP  │  │    FAULT    │◄─────┘       │
-        │  └────┬────┘  └──────┬──────┘              │
-        │       │              │                     │
-        │  Wakeup│         Fault│                    │
-        │  Event│        Cleared│                    │
-        │       ▼              │                     │
-        │  ┌─────────┐         │      ┌──────────────┤
-        │  │ WAKEUP  │─────────┼──────│  DIAGNOSTIC  │
-        │  └─────────┘         │      └──────────────┘
-        │                      │
-        └──────────────────────┘
+              ┌────────────────────────────────────────┐
+              │                                        │
+              ▼                                        │
+       ┌─────────────┐   Lock Cmd    ┌─────────────┐  │
+       │             │──────────────►│             │  │
+       │  UNLOCKED   │               │   LOCKING   │  │
+       │             │◄──────────────│             │  │
+       └─────────────┘  Update tick  └──────┬──────┘  │
+              ▲                             │         │
+              │                             │ Update  │
+              │ Unlock Cmd                  │ tick    │
+              │                             ▼         │
+       ┌──────┴──────┐               ┌─────────────┐  │
+       │             │               │             │  │
+       │  UNLOCKING  │◄──────────────│   LOCKED    │──┘
+       │             │  Unlock Cmd   │             │
+       └─────────────┘               └─────────────┘
 ```
-
-### State Descriptions
-
-| State | Description | Entry Condition | Exit Condition |
-|-------|-------------|-----------------|----------------|
-| INIT | System initialization | Power-on | Init complete |
-| NORMAL | Normal operation | From INIT/WAKEUP/FAULT | Sleep/Fault/Diag request |
-| SLEEP | Low-power sleep | Sleep request | Wake event |
-| WAKEUP | Wake-up transition | From SLEEP | Wakeup complete |
-| FAULT | Fault condition active | Critical fault detected | Fault cleared |
-| DIAGNOSTIC | Diagnostic session active | Diag tool request | Session end |
 
 ### Transitions
 
+| From | Event | To | Action |
+|------|-------|----|----|
+| UNLOCKED | Lock command | LOCKING | Start lock actuator |
+| LOCKING | Update tick | LOCKED | Actuator complete |
+| LOCKED | Unlock command | UNLOCKING | Start unlock actuator |
+| UNLOCKING | Update tick | UNLOCKED | Actuator complete |
+
+### Code Implementation
+
 ```c
-bcm_result_t bcm_request_state(bcm_state_t new_state);
-```
-
-Allowed transitions:
-- INIT → NORMAL
-- NORMAL → SLEEP, FAULT, DIAGNOSTIC
-- SLEEP → WAKEUP
-- WAKEUP → NORMAL
-- FAULT → NORMAL, DIAGNOSTIC
-- DIAGNOSTIC → NORMAL
-
----
-
-## Door Lock State Machine
-
-Each door has an independent lock state machine:
-
-```
-              ┌──────────────┐
-              │              │
-    ┌─────────│   UNKNOWN    │
-    │         │              │
-    │         └───────┬──────┘
-    │                 │ Status Read
-    │                 ▼
-    │         ┌──────────────┐          ┌──────────────┐
-    │         │              │  Lock    │              │
-    │    ┌────│   UNLOCKED   │─────────►│    LOCKED    │────┐
-    │    │    │              │◄─────────│              │    │
-    │    │    └──────────────┘  Unlock  └──────────────┘    │
-    │    │                                                   │
-    │    │    ┌──────────────┐                              │
-    │    │    │              │                              │
-    │    └───►│    MOVING    │◄─────────────────────────────┘
-    │         │              │
-    │         └──────────────┘
-    │                │
-    │                │ Timeout/Error
-    └────────────────┘
-```
-
-### Lock States
-
-| State | Description |
-|-------|-------------|
-| UNKNOWN | Initial state, position not yet determined |
-| UNLOCKED | Door is unlocked |
-| LOCKED | Door is locked |
-| MOVING | Lock actuator is in motion |
-
----
-
-## Window State Machine
-
-Each window operates independently:
-
-```
-                    ┌───────────────┐
-                    │               │
-        ┌───────────│    UNKNOWN    │
-        │           │               │
-        │           └───────┬───────┘
-        │                   │ Position Read
-        │                   ▼
-        │           ┌───────────────┐
-        │      ┌────│    CLOSED     │────┐
-        │      │    │   (100%)      │    │
-        │      │    └───────────────┘    │
-        │      │            ▲            │
-        │      │ Down       │ Up         │ Down
-        │      │ Cmd        │ Reached    │ Cmd
-        │      ▼            │            ▼
-        │  ┌────────────────┴────────────────┐
-        │  │                                 │
-        │  │         MOVING_UP               │
-        │  │              │                  │
-        │  │              │ Stop/            │
-        │  │              │ Anti-pinch       │
-        │  │              ▼                  │
-        │  │  ┌─────────────────────┐        │
-        │  │  │      PARTIAL        │        │
-        │  │  │     (1-99%)         │        │
-        │  │  └──────────┬──────────┘        │
-        │  │             │                   │
-        │  │         MOVING_DOWN             │
-        │  │             │                   │
-        │  └─────────────┴───────────────────┘
-        │                │
-        │                ▼
-        │        ┌───────────────┐
-        │        │     OPEN      │
-        │        │    (0%)       │
-        │        └───────────────┘
-        │                │
-        │                │ Error/Blocked
-        │                ▼
-        │        ┌───────────────┐
-        └───────►│   BLOCKED     │
-                 │               │
-                 └───────────────┘
-```
-
-### Window States
-
-| State | Position | Description |
-|-------|----------|-------------|
-| UNKNOWN | - | Position not yet calibrated |
-| CLOSED | 100% | Window fully closed |
-| OPEN | 0% | Window fully open |
-| PARTIAL | 1-99% | Window partially open |
-| MOVING_UP | - | Window closing |
-| MOVING_DOWN | - | Window opening |
-| BLOCKED | - | Anti-pinch activated or motor fault |
-
-### Anti-Pinch Logic
-
-```
-if (motor_current > ANTI_PINCH_THRESHOLD && moving_up) {
-    stop_motor();
-    reverse_motor_briefly();
-    state = BLOCKED;
-    report_fault(FAULT_DOOR_WINDOW_ANTI_PINCH);
+void door_control_update(uint32_t current_ms) {
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        switch (state->door.lock_state[i]) {
+            case DOOR_STATE_LOCKING:
+                state->door.lock_state[i] = DOOR_STATE_LOCKED;
+                break;
+            case DOOR_STATE_UNLOCKING:
+                state->door.lock_state[i] = DOOR_STATE_UNLOCKED;
+                break;
+            default:
+                break;
+        }
+    }
 }
 ```
 
 ---
 
-## Turn Signal State Machine
+## Lighting Control State Machines
+
+### Headlight Mode States
+
+| State | Value | Description |
+|-------|-------|-------------|
+| OFF | 0 | Headlights off |
+| ON | 1 | Low beam on |
+| AUTO | 2 | Automatic (sensor controlled) |
+
+### Headlight Output States
+
+| State | Value | Description |
+|-------|-------|-------------|
+| OFF | 0 | Lights physically off |
+| ON | 1 | Low beam active |
+| AUTO | 2 | Auto mode, lights on due to low ambient |
+| HIGH_BEAM | 3 | High beam active |
+
+### State Diagram (Headlight Mode)
 
 ```
-                 ┌──────────────────┐
-                 │                  │
-    ┌────────────│       OFF        │◄──────────────────────────────┐
-    │            │                  │                               │
-    │            └────────┬─────────┘                               │
-    │                     │                                         │
-    │      ┌──────────────┼──────────────┐                         │
-    │      │              │              │                         │
-    │      │ Left Cmd     │ Right Cmd    │ Hazard Cmd              │
-    │      ▼              ▼              ▼                         │
-    │  ┌────────┐    ┌────────┐    ┌────────────┐                  │
-    │  │  LEFT  │    │ RIGHT  │    │   HAZARD   │                  │
-    │  │ NORMAL │    │ NORMAL │    │            │                  │
-    │  └───┬────┘    └───┬────┘    └─────┬──────┘                  │
-    │      │             │               │                         │
-    │      │ Brief       │ Brief         │                         │
-    │      │ Tap         │ Tap           │ Off Cmd                 │
-    │      ▼             ▼               │                         │
-    │  ┌────────┐    ┌────────┐          │                         │
-    │  │ LANE   │    │ LANE   │          │                         │
-    │  │ CHANGE │    │ CHANGE │          │                         │
-    │  │ LEFT   │    │ RIGHT  │          │                         │
-    │  └───┬────┘    └───┬────┘          │                         │
-    │      │             │               │                         │
-    │      │ 3 Blinks    │ 3 Blinks      │                         │
-    │      │ Complete    │ Complete      │                         │
-    │      └─────────────┴───────────────┴─────────────────────────┘
-    │
-    │                  Flash Timing Loop
-    │                  ┌─────────────┐
-    │             ┌───►│   ON (lit)  │
-    │             │    └──────┬──────┘
-    │             │           │ on_time elapsed
-    │             │           ▼
-    │             │    ┌─────────────┐
-    │             └────│  OFF (dark) │
-    │                  └─────────────┘
-    │                        │ off_time elapsed
-    │                        │ (loops back to ON)
-    │
-    └── Off/Cancel Cmd anywhere ──────────────────────────────────►
+                   Off Cmd
+       ┌─────────────────────────────────┐
+       │                                 │
+       ▼         On Cmd                  │
+┌─────────────┐─────────►┌─────────────┐ │
+│             │          │             │ │
+│     OFF     │◄─────────│     ON      │ │
+│             │  Off Cmd │             │ │
+└──────┬──────┘          └──────┬──────┘ │
+       │                        │        │
+       │ Auto Cmd               │ Auto   │
+       │                        │ Cmd    │
+       ▼                        ▼        │
+┌─────────────────────────────────────┐  │
+│                                     │  │
+│               AUTO                  │──┘
+│    (Output based on ambient)        │ Off Cmd
+│                                     │
+└─────────────────────────────────────┘
 ```
 
-### Turn Signal Modes
-
-| Mode | Description | Exit Condition |
-|------|-------------|----------------|
-| OFF | No signals active | Command received |
-| NORMAL | Standard turn signal | Off command or auto-cancel |
-| LANE_CHANGE | 3-blink comfort feature | Blink count complete |
-| HAZARD | Both sides flashing | Off command |
-
-### Timing Parameters
+### Auto Mode Logic
 
 ```c
-#define TURN_SIGNAL_ON_TIME_MS   500   // Normal flash on
-#define TURN_SIGNAL_OFF_TIME_MS  500   // Normal flash off
-#define HAZARD_ON_TIME_MS        400   // Hazard on
-#define HAZARD_OFF_TIME_MS       400   // Hazard off
-#define TURN_FAST_FLASH_ON_MS    250   // Bulb failure on
-#define TURN_FAST_FLASH_OFF_MS   250   // Bulb failure off
-#define TURN_LANE_CHANGE_BLINKS  3     // Lane change count
+void update_headlight_output(void) {
+    if (mode == LIGHTING_STATE_AUTO) {
+        if (ambient_light < AUTO_ON_THRESHOLD) {
+            output = HEADLIGHT_STATE_AUTO;  // Lights on
+        } else if (ambient_light > AUTO_OFF_THRESHOLD) {
+            output = HEADLIGHT_STATE_OFF;   // Lights off
+        }
+    }
+}
 ```
+
+### Thresholds
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| AUTO_ON_THRESHOLD | 80 | Turn on below this (0-255 scale) |
+| AUTO_OFF_THRESHOLD | 120 | Turn off above this |
 
 ---
 
-## Lighting State Machine
+## Turn Signal State Machine
 
-### Headlight Mode State Machine
+### States
+
+| State | Value | Description |
+|-------|-------|-------------|
+| OFF | 0 | No signals active |
+| LEFT | 1 | Left turn signal flashing |
+| RIGHT | 2 | Right turn signal flashing |
+| HAZARD | 3 | Both signals flashing |
+
+### State Diagram
+
+```
+                            Off Cmd
+              ┌─────────────────────────────────┐
+              │                                 │
+              ▼          Left Cmd               │
+       ┌─────────────┐─────────►┌─────────────┐ │
+       │             │          │             │ │
+       │     OFF     │◄─────────│    LEFT     │ │
+       │             │  Off/    │             │ │
+       └──────┬──────┘  Timeout └─────────────┘ │
+              │                                 │
+              │ Right Cmd                       │ Hazard Off
+              ▼                                 │
+       ┌─────────────┐                          │
+       │             │──────────────────────────┘
+       │    RIGHT    │  Off/Timeout
+       │             │
+       └──────┬──────┘
+              │
+              │ Hazard Cmd (from any state)
+              ▼
+       ┌─────────────┐
+       │             │
+       │   HAZARD    │ (No timeout)
+       │             │
+       └─────────────┘
+```
+
+### Transitions
+
+| From | Event | To | Action |
+|------|-------|----|----|
+| OFF | Left command | LEFT | Start flashing left |
+| OFF | Right command | RIGHT | Start flashing right |
+| OFF | Hazard on | HAZARD | Start flashing both |
+| LEFT | Off command | OFF | Stop flashing |
+| LEFT | Timeout (30s) | OFF | Auto stop |
+| RIGHT | Off command | OFF | Stop flashing |
+| RIGHT | Timeout (30s) | OFF | Auto stop |
+| HAZARD | Hazard off | OFF | Stop flashing |
+| Any | Hazard on | HAZARD | Override current |
+
+### Flash Timing
+
+```
+        ON_TIME           OFF_TIME
+       ├────────┤        ├────────┤
+       │████████│        │        │████████│        │
+Time:  0       500      500     1000     1500     2000
+                    (milliseconds)
+```
+
+| Signal | On Time | Off Time |
+|--------|---------|----------|
+| Turn (L/R) | 500ms | 500ms |
+| Hazard | 400ms | 400ms |
+
+### Flash State Update
+
+```c
+void turn_signal_update(uint32_t current_ms) {
+    if (mode == TURN_SIG_STATE_OFF) return;
+    
+    uint32_t elapsed = current_ms - last_toggle_ms;
+    uint16_t phase_duration = currently_on ? on_time : off_time;
+    
+    if (elapsed >= phase_duration) {
+        currently_on = !currently_on;
+        last_toggle_ms = current_ms;
+        
+        // Update outputs based on mode
+        switch (mode) {
+            case TURN_SIG_STATE_LEFT:
+                left_output = currently_on;
+                break;
+            case TURN_SIG_STATE_HAZARD:
+                left_output = right_output = currently_on;
+                break;
+            // ...
+        }
+        
+        if (currently_on) flash_count++;
+    }
+}
+```
+
+### Timeout Behavior
+
+- Turn signals (LEFT/RIGHT) auto-off after 30 seconds
+- Hazard signals do NOT auto-off (safety feature)
+- Timeout sets FAULT_CODE_TIMEOUT
+
+---
+
+## BCM System State Machine
+
+### States
+
+| State | Value | Description |
+|-------|-------|-------------|
+| INIT | 0 | System initializing |
+| NORMAL | 1 | Normal operation |
+| FAULT | 2 | Critical fault active |
+| DIAGNOSTIC | 3 | Diagnostic mode |
+
+### State Diagram
 
 ```
               ┌───────────────┐
               │               │
-    ┌─────────│      OFF      │◄────────────────┐
-    │         │               │                 │
-    │         └───────┬───────┘                 │
-    │                 │                         │
-    │    ┌────────────┼────────────┐            │
-    │    │            │            │            │
-    │    ▼            ▼            ▼            │
-    │ ┌──────┐   ┌─────────┐  ┌─────────┐      │
-    │ │PARK- │   │  LOW    │  │  AUTO   │      │
-    │ │ING   │   │  BEAM   │  │         │      │
-    │ └──┬───┘   └────┬────┘  └────┬────┘      │
-    │    │            │            │            │
-    │    │            │    ┌───────┴────────┐  │
-    │    │            │    │ Ambient Light  │  │
-    │    │            │    │ Check          │  │
-    │    │            │    └───────┬────────┘  │
-    │    │            │            │            │
-    │    │            ▼            ▼            │
-    │    │       ┌─────────────────────┐       │
-    │    │       │  High Beam Toggle   │       │
-    │    │       └──────────┬──────────┘       │
-    │    │                  │                  │
-    │    │                  ▼                  │
-    │    │       ┌─────────────────────┐       │
-    │    │       │      HIGH BEAM      │       │
-    │    │       └─────────────────────┘       │
-    │    │                                     │
-    │    └─────────────────────────────────────┘
-    │
-    └── Off Command ───────────────────────────►
-```
-
-### Interior Light State Machine
-
-```
-        ┌───────────────┐
-        │               │
-   ┌────│      OFF      │◄────────────────────────────────────┐
-   │    │               │                                     │
-   │    └───────┬───────┘                                     │
-   │            │                                             │
-   │   ┌────────┼────────┐                                    │
-   │   │        │        │                                    │
-   │   │ Manual │ Door   │ Ignition                           │
-   │   │ On     │ Open   │ Off + Follow-Me-Home               │
-   │   ▼        ▼        ▼                                    │
-   │ ┌──────┐ ┌──────┐ ┌────────────────┐                    │
-   │ │  ON  │ │ DOOR │ │ FOLLOW-ME-HOME │                    │
-   │ │(255) │ │ MODE │ │    (timed)     │                    │
-   │ └──┬───┘ └──┬───┘ └────────┬───────┘                    │
-   │    │        │              │                             │
-   │    │        │ Door Closed  │ Timeout                     │
-   │    │        ▼              │                             │
-   │    │   ┌─────────────┐     │                             │
-   │    │   │   FADING    │     │                             │
-   │    │   │   OUT       │◄────┘                             │
-   │    │   └──────┬──────┘                                   │
-   │    │          │                                          │
-   │    │          │ Fade Complete                            │
-   │    │          │                                          │
-   │    └──────────┴──────────────────────────────────────────┘
+   Reset ────►│     INIT      │
+              │               │
+              └───────┬───────┘
+                      │ Init complete
+                      ▼
+              ┌───────────────┐
+              │               │◄─────────────┐
+    ┌────────►│    NORMAL     │              │
+    │         │               │──────┐       │
+    │         └───────┬───────┘      │       │
+    │                 │              │       │
+    │  Fault          │ Critical    │       │
+    │  cleared        │ fault       │ Diag  │
+    │                 ▼              │ exit  │
+    │         ┌───────────────┐      │       │
+    │         │               │◄─────┘       │
+    └─────────│    FAULT      │              │
+              │               │──────────────┤
+              └───────────────┘    Diag      │
+                                   enter     │
+                                             │
+              ┌───────────────┐              │
+              │               │◄─────────────┘
+              │  DIAGNOSTIC   │
+              │               │
+              └───────────────┘
 ```
 
 ---
 
-## Fault State Machine
+## Event Log
 
-```
-                    ┌───────────────────┐
-                    │                   │
-        ┌───────────│     INACTIVE      │◄─────────────────────────┐
-        │           │                   │                          │
-        │           └─────────┬─────────┘                          │
-        │                     │                                    │
-        │                     │ Fault Detected                     │
-        │                     ▼                                    │
-        │           ┌───────────────────┐                          │
-        │           │                   │                          │
-        │    ┌──────│     PENDING       │                          │
-        │    │      │   (debouncing)    │                          │
-        │    │      └─────────┬─────────┘                          │
-        │    │                │                                    │
-        │    │ Fault          │ Debounce                           │
-        │    │ Cleared        │ Complete                           │
-        │    │                ▼                                    │
-        │    │      ┌───────────────────┐                          │
-        │    │      │                   │                          │
-        │    │      │      ACTIVE       │─────────────┐            │
-        │    │      │                   │             │            │
-        │    │      └─────────┬─────────┘             │            │
-        │    │                │                       │            │
-        │    │                │ Fault Condition       │ Recovery   │
-        │    │                │ No Longer Present     │ Attempt    │
-        │    │                ▼                       │            │
-        │    │      ┌───────────────────┐             │            │
-        │    │      │                   │◄────────────┘            │
-        │    │      │      HEALED       │                          │
-        │    │      │   (heal timer)    │                          │
-        │    │      └─────────┬─────────┘                          │
-        │    │                │                                    │
-        │    │                │ Heal Timer                         │
-        │    │                │ Complete                           │
-        │    │                ▼                                    │
-        │    │      ┌───────────────────┐                          │
-        │    │      │                   │                          │
-        │    └─────►│      STORED       │──────────────────────────┘
-        │           │  (historical)     │         Clear Command
-        │           └───────────────────┘
-        │                     │
-        │                     │ Fault Re-detected
-        └─────────────────────┘
-```
+State transitions are logged to a ring buffer for debugging.
 
-### Fault Timing Parameters
+### Event Types
+
+| Type | Value | Data Content |
+|------|-------|--------------|
+| EVENT_NONE | 0 | - |
+| EVENT_DOOR_LOCK_CHANGE | 1 | [door_id, new_state, 0, 0] |
+| EVENT_HEADLIGHT_CHANGE | 3 | [type, old_state, new_state, 0] |
+| EVENT_TURN_SIGNAL_CHANGE | 5 | [old_mode, new_mode, 0, 0] |
+| EVENT_FAULT_SET | 6 | [1, fault_code, 0, 0] |
+| EVENT_FAULT_CLEAR | 7 | [0, fault_code, 0, 0] |
+| EVENT_CMD_RECEIVED | 8 | [cmd, param, 0, 0] |
+| EVENT_CMD_ERROR | 9 | [result, cmd, 0, 0] |
+
+### Log Entry Format
 
 ```c
-#define FAULT_DEBOUNCE_TIME_MS     100    // Time before confirming fault
-#define FAULT_HEALING_TIME_MS      1000   // Time before marking as stored
-#define FAULT_MAX_OCCURRENCES      10     // Max before permanent fault
-#define FAULT_MAX_RECOVERY_ATTEMPTS 3     // Recovery attempt limit
+typedef struct {
+    uint32_t        timestamp_ms;   // Event timestamp
+    event_type_t    type;           // Event type
+    uint8_t         data[4];        // Event-specific data
+} event_log_entry_t;
 ```
 
----
+### Ring Buffer
 
-## CAN Bus State Machine
-
-```
-                    ┌───────────────────┐
-                    │                   │
-        ┌───────────│  NOT INITIALIZED  │
-        │           │                   │
-        │           └─────────┬─────────┘
-        │                     │ can_interface_init()
-        │                     ▼
-        │           ┌───────────────────┐
-        │           │                   │◄──────────────────────────┐
-        │    ┌──────│        OK         │                          │
-        │    │      │                   │                          │
-        │    │      └─────────┬─────────┘                          │
-        │    │                │                                    │
-        │    │                │ TX Errors > 128                    │
-        │    │                ▼                                    │
-        │    │      ┌───────────────────┐                          │
-        │    │      │                   │                          │
-        │    │      │  ERROR PASSIVE    │──────────┐               │
-        │    │      │                   │          │               │
-        │    │      └─────────┬─────────┘          │               │
-        │    │                │                    │               │
-        │    │                │ TX Errors > 255    │ Errors < 128  │
-        │    │                ▼                    │               │
-        │    │      ┌───────────────────┐          │               │
-        │    │      │                   │          │               │
-        │    │      │     BUS OFF       │──────────┘               │
-        │    │      │                   │                          │
-        │    │      └─────────┬─────────┘                          │
-        │    │                │                                    │
-        │    │                │ Recovery Timer (500ms)             │
-        │    │                └─────────────────────────────────────┘
-        │    │
-        │    │ can_interface_deinit()
-        │    │
-        └────┴───────────────────────────────────────────────────►
-```
-
----
-
-## State Machine Implementation Guidelines
-
-1. **Single Entry Point**: Each state machine should have a single `_process()` function called periodically
-
-2. **Atomic Transitions**: State changes should be atomic to prevent race conditions
-
-3. **Timeout Handling**: All waiting states should have timeouts
-
-4. **Error Recovery**: Each state machine should handle errors gracefully and return to a known state
-
-5. **Logging**: State transitions should be logged for debugging
-
-6. **Testing**: Each state and transition should have corresponding unit tests
+- Size: 32 entries
+- Oldest entries overwritten when full
+- Preserved across normal operation
+- Cleared only on explicit request or reset

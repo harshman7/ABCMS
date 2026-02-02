@@ -1,22 +1,19 @@
 # BCM Testing Strategy
 
-This document outlines the comprehensive testing approach for the Body Control Module software.
+## Overview
 
-## Testing Levels
+This document describes the multi-level testing approach for the BCM software.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    System Integration Tests                      │
-│              (HIL, Vehicle-level, End-to-end)                   │
+│            SIL Testing (Software-in-the-Loop)                    │
+│                  vcan0 + can_simulator.py                        │
 ├─────────────────────────────────────────────────────────────────┤
-│                    Integration Tests                             │
-│              (Module interactions, CAN traffic)                  │
-├─────────────────────────────────────────────────────────────────┤
-│                    Unit Tests                                    │
-│              (Individual functions, state machines)              │
+│                    Unit Tests (CppUTest)                         │
+│              Direct module testing, stub CAN                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                    Static Analysis                               │
-│              (Code quality, MISRA compliance)                    │
+│              Compiler warnings, code review                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -24,12 +21,11 @@ This document outlines the comprehensive testing approach for the Body Control M
 
 ### Framework: CppUTest
 
-We use CppUTest for unit testing because:
+CppUTest is used for unit testing because:
 - Designed for embedded C/C++
-- Supports memory leak detection
-- Mock object support
-- Runs on host and target
-- No dynamic memory in test runners
+- No dynamic memory in test framework core
+- Mock support via CppUTestExt
+- Runs on host for fast iteration
 
 ### Test Structure
 
@@ -38,115 +34,137 @@ TEST_GROUP(ModuleName)
 {
     void setup() override
     {
-        // Initialize before each test
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);  // Stub mode
+        fault_manager_init();
         module_init();
     }
 
     void teardown() override
     {
-        // Cleanup after each test
-        module_deinit();
+        can_deinit();
     }
 };
 
 TEST(ModuleName, TestCase)
 {
     // Arrange
+    can_frame_t frame = build_cmd(...);
+    
     // Act
+    cmd_result_t result = module_handle_cmd(&frame);
+    
     // Assert
+    CHECK_EQUAL(CMD_RESULT_OK, result);
 }
 ```
 
-### Test Coverage Goals
+### Test Files
 
-| Module | Target Coverage | Priority |
-|--------|-----------------|----------|
-| Door Control | 90% | High |
-| Lighting Control | 90% | High |
-| Turn Signal | 95% | Critical |
-| Fault Manager | 95% | Critical |
-| CAN Interface | 85% | High |
-| BCM Core | 80% | Medium |
+| File | Module | Test Count |
+|------|--------|------------|
+| test_door_control.cpp | Door Control | ~25 |
+| test_lighting_control.cpp | Lighting | ~20 |
+| test_fault_manager.cpp | Fault Manager | ~25 |
 
-### Unit Test Categories
+### Test Categories
 
 #### 1. Initialization Tests
+
 ```cpp
-TEST(DoorControlInit, InitializesSuccessfully)
+TEST(DoorInit, AllDoorsUnlockedInitially)
 {
-    bcm_result_t result = door_control_init();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(DoorControlInit, RejectsDoubleInit)
-{
-    door_control_init();
-    bcm_result_t result = door_control_init();
-    CHECK_EQUAL(BCM_ERROR, result);
-}
-```
-
-#### 2. State Transition Tests
-```cpp
-TEST(DoorLock, TransitionsFromUnlockedToLocked)
-{
-    door_unlock(DOOR_FRONT_LEFT);
-    CHECK_EQUAL(LOCK_STATE_UNLOCKED, door_get_lock_state(DOOR_FRONT_LEFT));
-    
-    door_lock(DOOR_FRONT_LEFT);
-    CHECK_EQUAL(LOCK_STATE_LOCKED, door_get_lock_state(DOOR_FRONT_LEFT));
-}
-```
-
-#### 3. Boundary Tests
-```cpp
-TEST(WindowControl, RejectsInvalidPosition)
-{
-    bcm_result_t result = door_window_set_position(DOOR_FRONT_LEFT, 150);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(WindowControl, AcceptsMaxPosition)
-{
-    bcm_result_t result = door_window_set_position(DOOR_FRONT_LEFT, 100);
-    CHECK_EQUAL(BCM_OK, result);
-}
-```
-
-#### 4. Error Handling Tests
-```cpp
-TEST(FaultManager, HandlesFullFaultLog)
-{
-    // Fill fault log
-    for (int i = 0; i < BCM_MAX_FAULT_COUNT; i++) {
-        fault_report((fault_code_t)(0x1000 + i), FAULT_SEVERITY_WARNING);
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(i));
     }
-    
-    // One more should fail
-    bcm_result_t result = fault_report(0x2000, FAULT_SEVERITY_WARNING);
-    CHECK_EQUAL(BCM_ERROR_BUFFER_FULL, result);
 }
 ```
 
-#### 5. Timing Tests
+#### 2. Command Validation Tests
+
 ```cpp
-TEST(TurnSignal, FlashTimingCorrect)
+TEST(DoorCommandValidation, RejectsWrongDLC)
 {
-    turn_signal_left_on();
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 0);
+    frame.dlc = 3;  // Wrong length
     
-    // Check initial state is ON
-    CHECK_TRUE(turn_signal_is_illuminated(TURN_DIRECTION_LEFT));
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
+    CHECK_TRUE(fault_manager_is_active(FAULT_CODE_INVALID_LENGTH));
+}
+
+TEST(DoorCommandValidation, RejectsInvalidChecksum)
+{
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 0);
+    frame.data[DOOR_CMD_BYTE_CHECKSUM] = 0xFF;  // Bad checksum
     
-    // Process for ON time
-    turn_signal_process(TURN_SIGNAL_ON_TIME_MS);
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_CHECKSUM_ERROR, result);
+}
+
+TEST(DoorCommandValidation, RejectsInvalidCounter)
+{
+    can_frame_t frame1 = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 5);
+    door_control_handle_cmd(&frame1);
     
-    // Should now be OFF
-    CHECK_FALSE(turn_signal_is_illuminated(TURN_DIRECTION_LEFT));
+    can_frame_t frame2 = build_door_cmd(DOOR_CMD_UNLOCK_ALL, DOOR_ID_ALL, 7);
+    cmd_result_t result = door_control_handle_cmd(&frame2);
+    CHECK_EQUAL(CMD_RESULT_COUNTER_ERROR, result);
+}
+
+TEST(DoorCommandValidation, AcceptsWrappingCounter)
+{
+    can_frame_t frame1 = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 15);
+    door_control_handle_cmd(&frame1);
+    
+    can_frame_t frame2 = build_door_cmd(DOOR_CMD_UNLOCK_ALL, DOOR_ID_ALL, 0);
+    cmd_result_t result = door_control_handle_cmd(&frame2);
+    CHECK_EQUAL(CMD_RESULT_OK, result);  // Counter wrapped correctly
 }
 ```
 
-### Running Unit Tests
+#### 3. State Machine Tests
+
+```cpp
+TEST(DoorStateMachine, UnlockedToLockingToLocked)
+{
+    CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(0));
+    
+    door_control_lock(0);
+    CHECK_EQUAL(DOOR_STATE_LOCKING, door_control_get_lock_state(0));
+    
+    door_control_update(100);
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(0));
+}
+```
+
+#### 4. Status Frame Tests
+
+```cpp
+TEST(DoorStatusFrame, ChecksumValid)
+{
+    can_frame_t frame;
+    door_control_build_status_frame(&frame);
+    
+    uint8_t calc = can_calculate_checksum(frame.data, DOOR_STATUS_DLC - 1);
+    CHECK_EQUAL(calc, frame.data[DOOR_STATUS_BYTE_CHECKSUM]);
+}
+
+TEST(DoorStatusFrame, CounterIncrements)
+{
+    can_frame_t frame1, frame2;
+    
+    door_control_build_status_frame(&frame1);
+    uint8_t counter1 = CAN_GET_COUNTER(frame1.data[DOOR_STATUS_BYTE_VER_CTR]);
+    
+    door_control_build_status_frame(&frame2);
+    uint8_t counter2 = CAN_GET_COUNTER(frame2.data[DOOR_STATUS_BYTE_VER_CTR]);
+    
+    CHECK_EQUAL((counter1 + 1) & CAN_COUNTER_MASK, counter2);
+}
+```
+
+### Running Tests
 
 ```bash
 # Build with tests
@@ -154,316 +172,235 @@ mkdir build && cd build
 cmake -DBUILD_TESTS=ON ..
 cmake --build .
 
-# Run all tests
+# Run via CTest
 ctest --output-on-failure
 
-# Run with verbose output
+# Run directly with verbose output
 ./bcm_tests -v
 
 # Run specific test group
-./bcm_tests -g DoorControl
+./bcm_tests -g DoorLockCommands
 
 # Run specific test
-./bcm_tests -n DoorLockControl::LockAllSetsAllDoorsLocked
+./bcm_tests -n "DoorCommandValidation::RejectsInvalidChecksum"
 ```
 
----
+## SIL Testing
 
-## Integration Testing
-
-### CAN Integration Tests
-
-Test interactions between modules via CAN messages:
-
-```python
-# Python test using CAN simulator
-def test_keyfob_unlock_triggers_welcome_lights():
-    """Verify welcome lights activate when doors unlock via key fob"""
-    
-    # Send key fob unlock command
-    send_can(CAN_ID_KEYFOB_CMD, [KEYFOB_UNLOCK])
-    
-    # Wait for processing
-    time.sleep(0.1)
-    
-    # Verify door status shows unlocked
-    door_status = receive_can(CAN_ID_DOOR_STATUS, timeout=1.0)
-    assert (door_status.data[0] & 0x0F) == 0x00, "Doors should be unlocked"
-    
-    # Verify lighting status shows welcome lights
-    light_status = receive_can(CAN_ID_LIGHTING_STATUS, timeout=1.0)
-    assert (light_status.data[5] & 0x04) != 0, "Welcome lights should be active"
-```
-
-### Module Integration Test Matrix
-
-| Test Case | Modules Involved | CAN Messages |
-|-----------|------------------|--------------|
-| Key fob lock | Door, Lighting | KEYFOB_CMD → DOOR_STATUS |
-| Auto-lock at speed | Door, Vehicle Speed | VEHICLE_SPEED → DOOR_STATUS |
-| Auto headlights | Lighting, Ambient Sensor | AMBIENT_LIGHT → LIGHTING_STATUS |
-| Bulb failure indicator | Turn Signal, Fault | TURN_STATUS, BCM_FAULT |
-| Critical fault handling | Fault, BCM Core | BCM_STATUS, BCM_FAULT |
-
----
-
-## System Testing
-
-### Hardware-in-the-Loop (HIL) Testing
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        HIL System                           │
-│                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    │
-│  │   BCM ECU   │◄──►│    CAN      │◄──►│    HIL      │    │
-│  │   (Target)  │    │   Interface │    │  Simulator  │    │
-│  └─────────────┘    └─────────────┘    └─────────────┘    │
-│                                              │             │
-│                                              ▼             │
-│                                        ┌─────────────┐    │
-│                                        │   Test      │    │
-│                                        │   Scripts   │    │
-│                                        └─────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### System Test Scenarios
-
-#### Scenario 1: Normal Driving Cycle
-1. Unlock doors (key fob)
-2. Open driver door → Interior light on
-3. Close door → Interior light fade
-4. Ignition ON
-5. Engine start
-6. Accelerate → Auto-lock at 15 km/h
-7. Turn signal left → 3 blinks (lane change)
-8. Turn signal right → Continuous until cancelled
-9. Decelerate to stop
-10. Ignition OFF
-11. Lock doors (key fob)
-
-#### Scenario 2: Night Driving
-1. Unlock doors → Welcome lights
-2. Ignition ON
-3. Auto headlights activate (low ambient)
-4. High beam toggle
-5. Fog lights on/off
-6. Ignition OFF → Follow-me-home lights
-7. Timeout → Lights off
-
-#### Scenario 3: Fault Conditions
-1. Simulate bulb failure → Fast flash
-2. Simulate CAN bus-off → Recovery
-3. Simulate over-voltage → System response
-4. Clear faults via diagnostic tool
-
----
-
-## Static Analysis
-
-### MISRA C:2012 Compliance
-
-Key rules enforced:
-
-| Rule | Description | Enforcement |
-|------|-------------|-------------|
-| 8.13 | Pointer to const when possible | Warning |
-| 11.3 | No casts between pointer and integer | Error |
-| 14.4 | Controlling expression shall be boolean | Error |
-| 15.7 | All if...else chains shall end with else | Warning |
-| 17.7 | Return value shall be used | Warning |
-| 21.3 | No <stdlib.h> memory functions | Error |
-
-### Compiler Warnings
-
-Build with maximum warnings:
-
-```cmake
-add_compile_options(
-    -Wall
-    -Wextra
-    -Wpedantic
-    -Werror
-    -Wconversion
-    -Wshadow
-    -Wundef
-    -Wcast-align
-    -Wstrict-prototypes
-)
-```
-
-### Static Analysis Tools
-
-- **cppcheck**: General static analysis
-- **clang-tidy**: Clang-based checks
-- **PC-lint**: Commercial MISRA checker
+### Setup Virtual CAN
 
 ```bash
-# Run cppcheck
-cppcheck --enable=all --std=c11 src/ include/
+# Load vcan module
+sudo modprobe vcan
 
-# Run clang-tidy
-clang-tidy src/*.c -- -Iinclude -Iconfig
+# Create vcan0 interface
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+
+# Verify
+ip link show vcan0
 ```
 
----
+### Build with SocketCAN
+
+```bash
+mkdir build && cd build
+cmake -DBCM_SIL=ON ..
+cmake --build .
+```
+
+### Run BCM Application
+
+```bash
+# Terminal 1: Run BCM
+./bcm_app -i vcan0
+
+# Terminal 2: Run simulator
+python3 ../tools/can_simulator.py -i vcan0 --interactive
+```
+
+### SIL Scenarios
+
+#### Scenario 1: Basic Operation
+
+```
+1. Unlock all doors
+2. Turn on headlights
+3. Activate left turn signal
+4. Deactivate turn signal
+5. Turn off headlights
+6. Lock all doors
+```
+
+**Expected BCM output:**
+```
+[DOOR] Door 0: UNLOCKING
+[DOOR] Door 0: UNLOCKED
+[LIGHT] Headlight mode: 0 -> 1
+[TURN] LEFT ON
+[TURN] OFF
+[LIGHT] Headlight mode: 1 -> 0
+[DOOR] Door 0: LOCKING
+[DOOR] Door 0: LOCKED
+```
+
+#### Scenario 2: Hazard Lights
+
+```
+1. Activate hazard
+2. Observe flashing (both L/R)
+3. Deactivate hazard
+```
+
+**Expected BCM output:**
+```
+[TURN] HAZARD ON
+[    ...ms] ... Turn:HAZ[LR] ...
+[    ...ms] ... Turn:HAZ[--] ...
+[    ...ms] ... Turn:HAZ[LR] ...
+[TURN] OFF
+```
+
+#### Scenario 3: Fault Injection
+
+```
+1. Send frame with wrong DLC
+2. Send frame with bad checksum
+3. Send frame with invalid command
+```
+
+**Expected BCM output:**
+```
+[DOOR] Command error: 1   (INVALID_CMD - wrong DLC)
+[FAULT] SET: 0x23
+[LIGHT] Command error: 2  (CHECKSUM_ERROR)
+[FAULT] SET: 0x20
+[TURN] Command error: 1   (INVALID_CMD)
+[FAULT] SET: 0x22
+```
+
+### CAN Monitor
+
+```bash
+# Monitor all CAN traffic
+candump vcan0
+
+# Filter for BCM TX only
+candump vcan0,200:700
+```
+
+## Validation Matrix
+
+### What's Tested
+
+| Component | Unit Test | SIL Test |
+|-----------|-----------|----------|
+| Door lock/unlock | ✓ | ✓ |
+| Door state transitions | ✓ | ✓ |
+| Lighting on/off/auto | ✓ | ✓ |
+| Turn signal modes | ✓ | ✓ |
+| Flash timing | ✓ | ✓ |
+| Checksum validation | ✓ | ✓ |
+| Counter validation | ✓ | ✓ |
+| Invalid command rejection | ✓ | ✓ |
+| Fault recording | ✓ | ✓ |
+| Status frame generation | ✓ | ✓ |
+| Timeout handling | - | ✓ |
+| Multi-frame sequences | - | ✓ |
+
+### Edge Cases Covered
+
+| Edge Case | Test |
+|-----------|------|
+| Counter wrap (15 -> 0) | Unit |
+| Counter skip (5 -> 7) | Unit |
+| Max active faults | Unit |
+| Unknown fault code | Unit |
+| Wrong CAN ID | Unit |
+| Null frame pointer | Unit |
+| Double lock/unlock | Unit |
+| Invalid door ID | Unit |
+| Invalid brightness | Unit |
 
 ## Code Coverage
 
-### Coverage Tools
+Target coverage levels:
 
-- **gcov/lcov** for GCC
-- **llvm-cov** for Clang
+| Module | Target | Measured |
+|--------|--------|----------|
+| door_control.c | 90% | TBD |
+| lighting_control.c | 90% | TBD |
+| turn_signal.c | 90% | TBD |
+| fault_manager.c | 95% | TBD |
+| can_interface.c | 80% | TBD |
 
-### Generating Coverage Report
+### Generating Coverage (GCC)
 
 ```bash
-# Build with coverage
-cmake -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON ..
+cmake -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_FLAGS="--coverage" \
+      -DCMAKE_CXX_FLAGS="--coverage" \
+      ..
 cmake --build .
-
-# Run tests
 ctest
 
 # Generate report
 lcov --capture --directory . --output-file coverage.info
-lcov --remove coverage.info '/usr/*' --output-file coverage.info
-genhtml coverage.info --output-directory coverage_report
+genhtml coverage.info --output-directory coverage_html
 ```
 
-### Coverage Requirements
-
-| Level | Minimum | Target |
-|-------|---------|--------|
-| Statement | 80% | 90% |
-| Branch | 75% | 85% |
-| Function | 95% | 100% |
-
----
-
-## Regression Testing
-
-### Continuous Integration
+## Continuous Integration
 
 ```yaml
-# Example CI pipeline
-stages:
-  - build
-  - test
-  - analyze
-  - report
+# .github/workflows/ci.yml
+name: BCM CI
 
-build:
-  script:
-    - mkdir build && cd build
-    - cmake -DBUILD_TESTS=ON ..
-    - cmake --build .
+on: [push, pull_request]
 
-test:
-  script:
-    - cd build
-    - ctest --output-on-failure
-  artifacts:
-    reports:
-      junit: build/test_results.xml
-
-analyze:
-  script:
-    - cppcheck --enable=all --xml src/ 2> cppcheck.xml
-  artifacts:
-    reports:
-      codequality: cppcheck.xml
-
-coverage:
-  script:
-    - cd build
-    - cmake -DENABLE_COVERAGE=ON ..
-    - cmake --build .
-    - ctest
-    - lcov --capture --directory . --output-file coverage.info
-  artifacts:
-    paths:
-      - coverage.info
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake cpputest
+      
+      - name: Build
+        run: |
+          mkdir build && cd build
+          cmake -DBUILD_TESTS=ON ..
+          cmake --build .
+      
+      - name: Test
+        run: |
+          cd build
+          ctest --output-on-failure
 ```
 
-### Test Selection for Regression
-
-After code changes:
-
-| Change Type | Tests Required |
-|-------------|----------------|
-| Single function change | Unit tests for function + callers |
-| Module change | All module tests + integration tests |
-| Interface change | All dependent module tests |
-| Configuration change | Full test suite |
-| Critical bug fix | Full test suite + specific regression test |
-
----
-
-## Test Data Management
-
-### Test Vectors
-
-Store test vectors in structured format:
-
-```c
-/* test_vectors.h */
-typedef struct {
-    uint8_t can_data[8];
-    uint8_t can_len;
-    bcm_result_t expected_result;
-    door_position_t expected_door;
-    lock_state_t expected_state;
-} door_cmd_test_vector_t;
-
-static const door_cmd_test_vector_t DOOR_CMD_VECTORS[] = {
-    { {0x01}, 1, BCM_OK, DOOR_FRONT_LEFT, LOCK_STATE_LOCKED },
-    { {0x02}, 1, BCM_OK, DOOR_FRONT_LEFT, LOCK_STATE_UNLOCKED },
-    // ... more vectors
-};
-```
-
----
-
-## Defect Tracking
-
-### Defect Categories
-
-| Category | Description | Example |
-|----------|-------------|---------|
-| Functional | Feature not working | Lock command ignored |
-| Timing | Timing out of spec | Flash rate too slow |
-| Interface | CAN/API issue | Wrong message ID |
-| Safety | Safety-related | Anti-pinch failure |
-| Performance | Resource issue | Stack overflow |
-
-### Defect Lifecycle
+## Sample Test Output
 
 ```
-Found → Confirmed → Assigned → Fixed → Verified → Closed
+$ ./bcm_tests
+
+..............................................
+
+OK (70 tests, 70 ran, 185 checks, 0 ignored, 0 filtered out, 12 ms)
 ```
 
----
+Verbose output:
 
-## Test Deliverables
+```
+$ ./bcm_tests -v
 
-1. **Test Plan**: Overall testing approach
-2. **Test Cases**: Detailed test procedures
-3. **Test Reports**: Execution results
-4. **Coverage Reports**: Code coverage analysis
-5. **Defect Reports**: Issues found
-6. **Traceability Matrix**: Requirements to tests mapping
+TEST(FaultEdgeCases, UnknownFaultCodeNoFlag) - 0 ms
+TEST(FaultEdgeCases, ClearAllAfterMax) - 0 ms
+TEST(FaultEdgeCases, MaxFaultsHandled) - 0 ms
+TEST(FaultStatusFrame, CounterIncrements) - 0 ms
+TEST(FaultStatusFrame, VersionCorrect) - 0 ms
+...
 
----
-
-## Best Practices
-
-1. **Test Early**: Write tests alongside code
-2. **Test Often**: Run tests on every commit
-3. **Test Thoroughly**: Cover edge cases and error paths
-4. **Test Independently**: Tests should not depend on each other
-5. **Test Repeatably**: Same inputs should give same outputs
-6. **Document Tests**: Explain what and why you're testing
-7. **Maintain Tests**: Update tests when requirements change
-8. **Review Tests**: Code review includes test code
+OK (70 tests, 70 ran, 185 checks, 0 ignored, 0 filtered out, 15 ms)
+```

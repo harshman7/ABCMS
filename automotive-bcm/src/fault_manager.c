@@ -1,59 +1,46 @@
 /**
  * @file fault_manager.c
- * @brief Fault Management Module Implementation
+ * @brief Fault Manager Implementation
  *
- * Implements fault detection, logging, recovery, and DTC management.
+ * Tracks active faults and provides status frame generation.
  */
 
 #include <string.h>
+#include <stdio.h>
 #include "fault_manager.h"
-#include "bcm_config.h"
+#include "can_ids.h"
 
-/* =============================================================================
- * Private Definitions
- * ========================================================================== */
-
-/** Maximum number of registered recovery actions */
-#define MAX_RECOVERY_ACTIONS    16
-
-/** Fault entry with internal timing data */
-typedef struct {
-    fault_entry_t entry;
-    uint32_t debounce_start;
-    uint32_t healing_start;
-    bool in_debounce;
-    bool in_healing;
-} fault_internal_t;
-
-/** Recovery action registration */
-typedef struct {
-    fault_code_t code;
-    fault_recovery_action_t action;
-} recovery_registration_t;
-
-/** Fault manager state */
-typedef struct {
-    bool initialized;
-    fault_internal_t faults[BCM_MAX_FAULT_COUNT];
-    uint16_t fault_count;
-    recovery_registration_t recovery_actions[MAX_RECOVERY_ACTIONS];
-    uint8_t recovery_count;
-} fault_manager_state_t;
-
-static fault_manager_state_t g_fault_mgr;
-
-/* =============================================================================
- * Private Helper Functions
- * ========================================================================== */
+/*******************************************************************************
+ * Private Functions
+ ******************************************************************************/
 
 /**
- * @brief Find fault entry by code
+ * @brief Map fault code to flags bit
+ */
+static uint8_t fault_code_to_flag(fault_code_t code)
+{
+    switch (code) {
+        case FAULT_CODE_DOOR_MOTOR:         return FAULT_BIT_DOOR_MOTOR;
+        case FAULT_CODE_HEADLIGHT_BULB:     return FAULT_BIT_HEADLIGHT_BULB;
+        case FAULT_CODE_TURN_BULB:          return FAULT_BIT_TURN_BULB;
+        case FAULT_CODE_CAN_COMM:           return FAULT_BIT_CAN_COMM;
+        case FAULT_CODE_INVALID_CHECKSUM:   return FAULT_BIT_CMD_CHECKSUM;
+        case FAULT_CODE_INVALID_COUNTER:    return FAULT_BIT_CMD_COUNTER;
+        case FAULT_CODE_TIMEOUT:            return FAULT_BIT_TIMEOUT;
+        default:                            return 0;
+    }
+}
+
+/**
+ * @brief Find fault in active faults array
  * @return Index if found, -1 if not found
  */
-static int find_fault_index(fault_code_t code)
+static int find_fault(fault_code_t code)
 {
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count; i++) {
-        if (g_fault_mgr.faults[i].entry.code == code) {
+    const fault_state_t *fault = &sys_state_get()->fault;
+    
+    for (uint8_t i = 0; i < fault->active_count; i++) {
+        if (fault->active_faults[i].code == code) {
             return (int)i;
         }
     }
@@ -61,469 +48,163 @@ static int find_fault_index(fault_code_t code)
 }
 
 /**
- * @brief Find or create fault entry
- * @return Index of entry, -1 if full
+ * @brief Log fault event
  */
-static int get_or_create_fault(fault_code_t code, fault_severity_t severity)
+static void log_fault_event(bool set, fault_code_t code)
 {
-    int idx = find_fault_index(code);
-    
-    if (idx >= 0) {
-        return idx;
-    }
-    
-    /* Create new entry */
-    if (g_fault_mgr.fault_count >= BCM_MAX_FAULT_COUNT) {
-        return -1;  /* Fault log full */
-    }
-    
-    idx = (int)g_fault_mgr.fault_count;
-    memset(&g_fault_mgr.faults[idx], 0, sizeof(fault_internal_t));
-    g_fault_mgr.faults[idx].entry.code = code;
-    g_fault_mgr.faults[idx].entry.severity = severity;
-    g_fault_mgr.faults[idx].entry.status = FAULT_STATUS_INACTIVE;
-    g_fault_mgr.fault_count++;
-    
-    return idx;
+    uint8_t data[4] = { set ? 1U : 0U, (uint8_t)code, 0, 0 };
+    event_log_add(set ? EVENT_FAULT_SET : EVENT_FAULT_CLEAR, data);
 }
 
-/**
- * @brief Find recovery action for fault
- */
-static fault_recovery_action_t find_recovery_action(fault_code_t code)
+/*******************************************************************************
+ * Public Functions
+ ******************************************************************************/
+
+void fault_manager_init(void)
 {
-    for (uint8_t i = 0; i < g_fault_mgr.recovery_count; i++) {
-        if (g_fault_mgr.recovery_actions[i].code == code) {
-            return g_fault_mgr.recovery_actions[i].action;
-        }
-    }
-    return NULL;
+    fault_state_t *fault = &sys_state_get_mut()->fault;
+    
+    fault->flags1 = 0;
+    fault->flags2 = 0;
+    fault->active_count = 0;
+    fault->total_count = 0;
+    fault->most_recent_code = FAULT_CODE_NONE;
+    fault->most_recent_time_ms = 0;
+    
+    memset(fault->active_faults, 0, sizeof(fault->active_faults));
+    
+    printf("[FAULT] Initialized\n");
 }
 
-/* =============================================================================
- * Initialization
- * ========================================================================== */
-
-bcm_result_t fault_manager_init(void)
+void fault_manager_set(fault_code_t code)
 {
-    memset(&g_fault_mgr, 0, sizeof(g_fault_mgr));
-    g_fault_mgr.initialized = true;
-    return BCM_OK;
-}
-
-void fault_manager_deinit(void)
-{
-    g_fault_mgr.initialized = false;
-}
-
-/* =============================================================================
- * Processing
- * ========================================================================== */
-
-bcm_result_t fault_manager_process(uint32_t timestamp_ms)
-{
-    if (!g_fault_mgr.initialized) {
-        return BCM_ERROR_NOT_READY;
+    fault_state_t *fault = &sys_state_get_mut()->fault;
+    const system_state_t *state = sys_state_get();
+    
+    /* Check if already active */
+    if (find_fault(code) >= 0) {
+        return; /* Already active */
     }
     
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count; i++) {
-        fault_internal_t *fault = &g_fault_mgr.faults[i];
-        
-        /* Process debouncing */
-        if (fault->in_debounce) {
-            if ((timestamp_ms - fault->debounce_start) >= FAULT_DEBOUNCE_TIME_MS) {
-                fault->entry.status = FAULT_STATUS_ACTIVE;
-                fault->in_debounce = false;
-                
-                /* Attempt automatic recovery if configured */
-                if (FAULT_ENABLE_RECOVERY && 
-                    fault->entry.recovery_attempts < FAULT_MAX_RECOVERY_ATTEMPTS) {
-                    fault_attempt_recovery(fault->entry.code);
-                }
-            }
-        }
-        
-        /* Process healing */
-        if (fault->in_healing) {
-            if ((timestamp_ms - fault->healing_start) >= FAULT_HEALING_TIME_MS) {
-                fault->entry.status = FAULT_STATUS_STORED;
-                fault->in_healing = false;
-            }
-        }
+    /* Add to active faults if room */
+    if (fault->active_count < MAX_ACTIVE_FAULTS) {
+        fault->active_faults[fault->active_count].code = code;
+        fault->active_faults[fault->active_count].timestamp_ms = state->uptime_ms;
+        fault->active_count++;
     }
     
-    return BCM_OK;
-}
-
-/* =============================================================================
- * Fault Reporting
- * ========================================================================== */
-
-bcm_result_t fault_report(fault_code_t code, fault_severity_t severity)
-{
-    return fault_report_with_data(code, severity, NULL);
-}
-
-bcm_result_t fault_report_with_data(fault_code_t code, 
-                                     fault_severity_t severity,
-                                     const uint8_t *freeze_frame)
-{
-    if (!g_fault_mgr.initialized) {
-        return BCM_ERROR_NOT_READY;
-    }
+    /* Update flags */
+    fault->flags1 |= fault_code_to_flag(code);
     
-    int idx = get_or_create_fault(code, severity);
+    /* Update most recent */
+    fault->most_recent_code = code;
+    fault->most_recent_time_ms = state->uptime_ms;
+    fault->total_count++;
+    
+    log_fault_event(true, code);
+    printf("[FAULT] SET: 0x%02X\n", code);
+}
+
+void fault_manager_clear(fault_code_t code)
+{
+    fault_state_t *fault = &sys_state_get_mut()->fault;
+    
+    int idx = find_fault(code);
     if (idx < 0) {
-        return BCM_ERROR_BUFFER_FULL;
+        return; /* Not found */
     }
     
-    fault_internal_t *fault = &g_fault_mgr.faults[idx];
-    uint32_t now = system_state_get()->uptime_ms;
-    
-    /* Update fault data */
-    fault->entry.last_occurrence = now;
-    fault->entry.occurrence_count++;
-    
-    if (fault->entry.first_occurrence == 0) {
-        fault->entry.first_occurrence = now;
+    /* Remove from array by shifting */
+    for (uint8_t i = (uint8_t)idx; i < fault->active_count - 1; i++) {
+        fault->active_faults[i] = fault->active_faults[i + 1];
     }
+    fault->active_count--;
     
-    if (freeze_frame) {
-        memcpy(fault->entry.freeze_frame, freeze_frame, 8);
-    }
+    /* Update flags */
+    fault->flags1 &= ~fault_code_to_flag(code);
     
-    /* Start debounce if not already active/pending */
-    if (fault->entry.status == FAULT_STATUS_INACTIVE ||
-        fault->entry.status == FAULT_STATUS_STORED ||
-        fault->entry.status == FAULT_STATUS_HEALED) {
-        fault->entry.status = FAULT_STATUS_PENDING;
-        fault->debounce_start = now;
-        fault->in_debounce = true;
-        fault->in_healing = false;
-    }
-    
-    return BCM_OK;
+    log_fault_event(false, code);
+    printf("[FAULT] CLEAR: 0x%02X\n", code);
 }
 
-bcm_result_t fault_clear(fault_code_t code)
+void fault_manager_clear_all(void)
 {
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return BCM_ERROR;
+    fault_state_t *fault = &sys_state_get_mut()->fault;
+    
+    for (uint8_t i = 0; i < fault->active_count; i++) {
+        log_fault_event(false, fault->active_faults[i].code);
     }
     
-    g_fault_mgr.faults[idx].entry.status = FAULT_STATUS_INACTIVE;
-    g_fault_mgr.faults[idx].in_debounce = false;
-    g_fault_mgr.faults[idx].in_healing = false;
+    fault->flags1 = 0;
+    fault->flags2 = 0;
+    fault->active_count = 0;
     
-    return BCM_OK;
+    printf("[FAULT] CLEAR ALL\n");
 }
 
-bcm_result_t fault_clear_all(void)
+bool fault_manager_is_active(fault_code_t code)
 {
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count; i++) {
-        g_fault_mgr.faults[i].entry.status = FAULT_STATUS_INACTIVE;
-        g_fault_mgr.faults[i].in_debounce = false;
-        g_fault_mgr.faults[i].in_healing = false;
-    }
-    
-    return BCM_OK;
+    return (find_fault(code) >= 0);
 }
 
-bcm_result_t fault_heal(fault_code_t code)
+uint8_t fault_manager_get_count(void)
 {
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return BCM_ERROR;
-    }
-    
-    fault_internal_t *fault = &g_fault_mgr.faults[idx];
-    
-    if (fault->entry.status == FAULT_STATUS_ACTIVE ||
-        fault->entry.status == FAULT_STATUS_PENDING) {
-        fault->entry.status = FAULT_STATUS_HEALED;
-        fault->healing_start = system_state_get()->uptime_ms;
-        fault->in_healing = true;
-        fault->in_debounce = false;
-    }
-    
-    return BCM_OK;
+    return sys_state_get()->fault.active_count;
 }
 
-/* =============================================================================
- * Fault Status Queries
- * ========================================================================== */
-
-bool fault_is_active(fault_code_t code)
+uint8_t fault_manager_get_flags1(void)
 {
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return false;
-    }
-    
-    return g_fault_mgr.faults[idx].entry.status == FAULT_STATUS_ACTIVE;
+    return sys_state_get()->fault.flags1;
 }
 
-bool fault_is_present(fault_code_t code)
+uint8_t fault_manager_get_flags2(void)
 {
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return false;
-    }
-    
-    fault_status_t status = g_fault_mgr.faults[idx].entry.status;
-    return (status == FAULT_STATUS_ACTIVE || status == FAULT_STATUS_PENDING);
+    return sys_state_get()->fault.flags2;
 }
 
-fault_status_t fault_get_status(fault_code_t code)
+fault_code_t fault_manager_get_most_recent(void)
 {
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return FAULT_STATUS_INACTIVE;
-    }
-    
-    return g_fault_mgr.faults[idx].entry.status;
+    return sys_state_get()->fault.most_recent_code;
 }
 
-bcm_result_t fault_get_entry(fault_code_t code, fault_entry_t *entry)
+void fault_manager_build_status_frame(can_frame_t *frame)
 {
-    if (!entry) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
+    const fault_state_t *fault = &sys_state_get()->fault;
+    system_state_t *mut_state = sys_state_get_mut();
     
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return BCM_ERROR;
-    }
+    memset(frame, 0, sizeof(can_frame_t));
+    frame->id = CAN_ID_FAULT_STATUS;
+    frame->dlc = FAULT_STATUS_DLC;
     
-    *entry = g_fault_mgr.faults[idx].entry;
-    return BCM_OK;
+    /* Byte 0: Fault flags 1 */
+    frame->data[FAULT_STATUS_BYTE_FLAGS1] = fault->flags1;
+    
+    /* Byte 1: Fault flags 2 */
+    frame->data[FAULT_STATUS_BYTE_FLAGS2] = fault->flags2;
+    
+    /* Byte 2: Total fault count */
+    frame->data[FAULT_STATUS_BYTE_COUNT] = fault->total_count;
+    
+    /* Byte 3: Most recent fault code */
+    frame->data[FAULT_STATUS_BYTE_RECENT_CODE] = (uint8_t)fault->most_recent_code;
+    
+    /* Bytes 4-5: Timestamp (seconds since boot) */
+    uint16_t timestamp_sec = (uint16_t)(fault->most_recent_time_ms / 1000U);
+    frame->data[FAULT_STATUS_BYTE_TS_HIGH] = (uint8_t)(timestamp_sec >> 8);
+    frame->data[FAULT_STATUS_BYTE_TS_LOW] = (uint8_t)(timestamp_sec & 0xFF);
+    
+    /* Byte 6: Version and counter */
+    frame->data[FAULT_STATUS_BYTE_VER_CTR] = CAN_BUILD_VER_CTR(
+        CAN_SCHEMA_VERSION, mut_state->tx_counter_fault);
+    mut_state->tx_counter_fault = (mut_state->tx_counter_fault + 1) & CAN_COUNTER_MASK;
+    
+    /* Byte 7: Checksum */
+    frame->data[FAULT_STATUS_BYTE_CHECKSUM] = can_calculate_checksum(
+        frame->data, FAULT_STATUS_DLC - 1);
 }
 
-uint16_t fault_get_active_count(void)
+void fault_manager_update(uint32_t current_ms)
 {
-    uint16_t count = 0;
-    
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count; i++) {
-        if (g_fault_mgr.faults[i].entry.status == FAULT_STATUS_ACTIVE ||
-            g_fault_mgr.faults[i].entry.status == FAULT_STATUS_PENDING) {
-            count++;
-        }
-    }
-    
-    return count;
-}
-
-uint16_t fault_get_stored_count(void)
-{
-    return g_fault_mgr.fault_count;
-}
-
-bool fault_any_critical(void)
-{
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count; i++) {
-        if (g_fault_mgr.faults[i].entry.severity == FAULT_SEVERITY_CRITICAL &&
-            (g_fault_mgr.faults[i].entry.status == FAULT_STATUS_ACTIVE ||
-             g_fault_mgr.faults[i].entry.status == FAULT_STATUS_PENDING)) {
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-/* =============================================================================
- * Fault Log Access
- * ========================================================================== */
-
-bcm_result_t fault_get_by_index(uint16_t index, fault_entry_t *entry)
-{
-    if (!entry || index >= g_fault_mgr.fault_count) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    *entry = g_fault_mgr.faults[index].entry;
-    return BCM_OK;
-}
-
-uint16_t fault_get_active_codes(fault_code_t *codes, uint16_t max_codes)
-{
-    if (!codes || max_codes == 0) {
-        return 0;
-    }
-    
-    uint16_t count = 0;
-    
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count && count < max_codes; i++) {
-        if (g_fault_mgr.faults[i].entry.status == FAULT_STATUS_ACTIVE ||
-            g_fault_mgr.faults[i].entry.status == FAULT_STATUS_PENDING) {
-            codes[count++] = g_fault_mgr.faults[i].entry.code;
-        }
-    }
-    
-    return count;
-}
-
-uint16_t fault_get_snapshot(uint8_t *buffer, uint16_t buffer_size)
-{
-    if (!buffer || buffer_size < 4) {
-        return 0;
-    }
-    
-    uint16_t offset = 0;
-    
-    /* Header: fault count */
-    buffer[offset++] = (uint8_t)(g_fault_mgr.fault_count >> 8);
-    buffer[offset++] = (uint8_t)(g_fault_mgr.fault_count);
-    
-    /* Active count */
-    uint16_t active = fault_get_active_count();
-    buffer[offset++] = (uint8_t)(active >> 8);
-    buffer[offset++] = (uint8_t)(active);
-    
-    /* Fault codes (2 bytes each) */
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count && (offset + 3) <= buffer_size; i++) {
-        buffer[offset++] = (uint8_t)(g_fault_mgr.faults[i].entry.code >> 8);
-        buffer[offset++] = (uint8_t)(g_fault_mgr.faults[i].entry.code);
-        buffer[offset++] = (uint8_t)g_fault_mgr.faults[i].entry.status;
-    }
-    
-    return offset;
-}
-
-/* =============================================================================
- * Fault Recovery
- * ========================================================================== */
-
-bcm_result_t fault_register_recovery(fault_code_t code, 
-                                      fault_recovery_action_t action)
-{
-    if (!action) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    if (g_fault_mgr.recovery_count >= MAX_RECOVERY_ACTIONS) {
-        return BCM_ERROR_BUFFER_FULL;
-    }
-    
-    g_fault_mgr.recovery_actions[g_fault_mgr.recovery_count].code = code;
-    g_fault_mgr.recovery_actions[g_fault_mgr.recovery_count].action = action;
-    g_fault_mgr.recovery_count++;
-    
-    return BCM_OK;
-}
-
-bcm_result_t fault_attempt_recovery(fault_code_t code)
-{
-    int idx = find_fault_index(code);
-    if (idx < 0) {
-        return BCM_ERROR;
-    }
-    
-    fault_recovery_action_t action = find_recovery_action(code);
-    if (!action) {
-        return BCM_ERROR_NOT_SUPPORTED;
-    }
-    
-    g_fault_mgr.faults[idx].entry.recovery_attempts++;
-    
-    bcm_result_t result = action(code);
-    if (result == BCM_OK) {
-        /* Recovery successful - heal the fault */
-        fault_heal(code);
-    }
-    
-    return result;
-}
-
-/* =============================================================================
- * Diagnostic Interface
- * ========================================================================== */
-
-uint16_t fault_read_dtc_by_status(uint8_t status_mask, 
-                                   uint8_t *buffer, 
-                                   uint16_t buffer_size)
-{
-    if (!buffer || buffer_size < 1) {
-        return 0;
-    }
-    
-    uint16_t offset = 0;
-    
-    /* Status availability mask */
-    buffer[offset++] = status_mask;
-    
-    for (uint16_t i = 0; i < g_fault_mgr.fault_count && (offset + 4) <= buffer_size; i++) {
-        fault_entry_t *entry = &g_fault_mgr.faults[i].entry;
-        
-        /* Convert internal status to UDS status byte */
-        uint8_t uds_status = 0;
-        if (entry->status == FAULT_STATUS_ACTIVE) {
-            uds_status |= 0x01;  /* testFailed */
-            uds_status |= 0x04;  /* pendingDTC */
-            uds_status |= 0x08;  /* confirmedDTC */
-        } else if (entry->status == FAULT_STATUS_PENDING) {
-            uds_status |= 0x04;  /* pendingDTC */
-        } else if (entry->status == FAULT_STATUS_STORED) {
-            uds_status |= 0x08;  /* confirmedDTC */
-        }
-        
-        if ((uds_status & status_mask) != 0) {
-            /* DTC high byte */
-            buffer[offset++] = (uint8_t)(entry->code >> 8);
-            /* DTC low byte */
-            buffer[offset++] = (uint8_t)(entry->code);
-            /* DTC status byte */
-            buffer[offset++] = uds_status;
-        }
-    }
-    
-    return offset;
-}
-
-bcm_result_t fault_clear_dtc(uint32_t group_of_dtc)
-{
-    if (group_of_dtc == 0xFFFFFF) {
-        /* Clear all DTCs */
-        return fault_clear_all();
-    }
-    
-    /* Clear specific group - for now just clear if code matches */
-    return fault_clear((fault_code_t)group_of_dtc);
-}
-
-/* =============================================================================
- * CAN Message Handling
- * ========================================================================== */
-
-void fault_manager_get_can_status(uint8_t *data, uint8_t *len)
-{
-    uint16_t active_count = fault_get_active_count();
-    uint16_t stored_count = fault_get_stored_count();
-    
-    /* Byte 0-1: Active fault count */
-    data[0] = (uint8_t)(active_count >> 8);
-    data[1] = (uint8_t)(active_count);
-    
-    /* Byte 2-3: Stored fault count */
-    data[2] = (uint8_t)(stored_count >> 8);
-    data[3] = (uint8_t)(stored_count);
-    
-    /* Byte 4-5: Most recent fault code */
-    if (stored_count > 0) {
-        fault_code_t recent = g_fault_mgr.faults[stored_count - 1].entry.code;
-        data[4] = (uint8_t)(recent >> 8);
-        data[5] = (uint8_t)(recent);
-    } else {
-        data[4] = 0;
-        data[5] = 0;
-    }
-    
-    /* Byte 6: Critical fault flag */
-    data[6] = fault_any_critical() ? 0x01 : 0x00;
-    
-    /* Byte 7: Reserved */
-    data[7] = 0;
-    
-    *len = 8;
+    /* Future: implement fault aging, auto-clear, etc. */
+    (void)current_ms;
 }

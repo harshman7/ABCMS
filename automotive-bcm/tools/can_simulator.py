@@ -1,521 +1,400 @@
 #!/usr/bin/env python3
 """
-CAN Bus Simulator for BCM Testing
+BCM CAN Simulator
 
-This tool simulates CAN bus traffic for testing the Body Control Module.
-It can send commands and simulate vehicle sensor data.
+Sends CAN frames to vcan0 to test the Body Control Module.
+Includes predefined scenarios and manual command mode.
 
 Requirements:
     pip install python-can
 
 Usage:
-    python can_simulator.py [--interface vcan0] [--mode interactive]
-
-For virtual CAN on Linux:
-    sudo modprobe vcan
-    sudo ip link add dev vcan0 type vcan
-    sudo ip link set up vcan0
+    python can_simulator.py [options]
+    
+Options:
+    --interface, -i    CAN interface (default: vcan0)
+    --scenario, -s     Run scenario: 1, 2, 3, or 'all'
+    --interactive      Interactive command mode
+    
+Examples:
+    python can_simulator.py -s 1              # Run scenario 1
+    python can_simulator.py -s all            # Run all scenarios
+    python can_simulator.py --interactive     # Interactive mode
 """
 
 import argparse
-import sys
 import time
-import threading
 import struct
-from typing import Optional, Dict, Callable
-from dataclasses import dataclass
-from enum import IntEnum
+import sys
 
+# Try to import python-can, fallback to socket
 try:
     import can
     CAN_AVAILABLE = True
 except ImportError:
     CAN_AVAILABLE = False
-    print("Warning: python-can not installed. Running in simulation mode.")
-
+    print("Warning: python-can not installed. Using socket fallback.")
+    import socket
 
 # =============================================================================
-# CAN ID Definitions (must match can_ids.h)
+# CAN IDs and Constants (must match can_ids.h)
 # =============================================================================
 
-class CanIds(IntEnum):
-    """CAN Message IDs"""
-    # BCM Status (TX from BCM)
-    BCM_STATUS = 0x200
-    DOOR_STATUS = 0x210
-    LIGHTING_STATUS = 0x220
-    TURN_SIGNAL_STATUS = 0x230
-    BCM_FAULT = 0x240
-    BCM_HEARTBEAT = 0x250
+CAN_ID_DOOR_CMD         = 0x100
+CAN_ID_LIGHTING_CMD     = 0x110
+CAN_ID_TURN_SIGNAL_CMD  = 0x120
+
+CAN_ID_DOOR_STATUS      = 0x200
+CAN_ID_LIGHTING_STATUS  = 0x210
+CAN_ID_TURN_STATUS      = 0x220
+CAN_ID_FAULT_STATUS     = 0x230
+CAN_ID_BCM_HEARTBEAT    = 0x240
+
+CAN_SCHEMA_VERSION      = 0x01
+CAN_CHECKSUM_SEED       = 0xAA
+
+# Door commands
+DOOR_CMD_LOCK_ALL       = 0x01
+DOOR_CMD_UNLOCK_ALL     = 0x02
+DOOR_CMD_LOCK_SINGLE    = 0x03
+DOOR_CMD_UNLOCK_SINGLE  = 0x04
+
+# Lighting commands
+HEADLIGHT_CMD_OFF       = 0x00
+HEADLIGHT_CMD_ON        = 0x01
+HEADLIGHT_CMD_AUTO      = 0x02
+HEADLIGHT_CMD_HIGH_ON   = 0x03
+HEADLIGHT_CMD_HIGH_OFF  = 0x04
+
+INTERIOR_CMD_OFF        = 0x00
+INTERIOR_CMD_ON         = 0x01
+INTERIOR_CMD_AUTO       = 0x02
+
+# Turn signal commands
+TURN_CMD_OFF            = 0x00
+TURN_CMD_LEFT_ON        = 0x01
+TURN_CMD_RIGHT_ON       = 0x02
+TURN_CMD_HAZARD_ON      = 0x03
+TURN_CMD_HAZARD_OFF     = 0x04
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def calculate_checksum(data):
+    """Calculate XOR checksum with seed"""
+    checksum = CAN_CHECKSUM_SEED
+    for byte in data:
+        checksum ^= byte
+    return checksum
+
+def build_ver_ctr(version, counter):
+    """Build version/counter byte"""
+    return ((version & 0x0F) << 4) | (counter & 0x0F)
+
+class Counter:
+    """Rolling counter manager"""
+    def __init__(self):
+        self.counters = {}
     
-    # BCM Commands (RX to BCM)
-    DOOR_CMD = 0x300
-    LIGHTING_CMD = 0x310
-    TURN_SIGNAL_CMD = 0x320
-    BCM_CONFIG_CMD = 0x330
-    
-    # External ECU Messages
-    IGNITION_STATUS = 0x100
-    VEHICLE_SPEED = 0x110
-    ENGINE_STATUS = 0x120
-    KEYFOB_CMD = 0x130
-    AMBIENT_LIGHT = 0x140
-    RAIN_SENSOR = 0x150
+    def get(self, can_id):
+        if can_id not in self.counters:
+            self.counters[can_id] = 0
+        val = self.counters[can_id]
+        self.counters[can_id] = (val + 1) & 0x0F
+        return val
 
-
-class DoorCommands(IntEnum):
-    """Door control commands"""
-    LOCK_ALL = 0x01
-    UNLOCK_ALL = 0x02
-    LOCK_SINGLE = 0x03
-    UNLOCK_SINGLE = 0x04
-    WINDOW_UP = 0x10
-    WINDOW_DOWN = 0x11
-    WINDOW_STOP = 0x12
-    CHILD_LOCK_ON = 0x20
-    CHILD_LOCK_OFF = 0x21
-
-
-class LightingCommands(IntEnum):
-    """Lighting control commands"""
-    HEADLIGHTS_ON = 0x01
-    HEADLIGHTS_OFF = 0x02
-    HEADLIGHTS_AUTO = 0x03
-    HIGH_BEAM_ON = 0x10
-    HIGH_BEAM_OFF = 0x11
-    FOG_LIGHTS_ON = 0x20
-    FOG_LIGHTS_OFF = 0x21
-    INTERIOR_ON = 0x30
-    INTERIOR_OFF = 0x31
-    INTERIOR_DIM = 0x32
-
-
-class TurnSignalCommands(IntEnum):
-    """Turn signal commands"""
-    LEFT_ON = 0x01
-    LEFT_OFF = 0x02
-    RIGHT_ON = 0x03
-    RIGHT_OFF = 0x04
-    HAZARD_ON = 0x10
-    HAZARD_OFF = 0x11
-
-
-class IgnitionState(IntEnum):
-    """Ignition states"""
-    OFF = 0x00
-    ACC = 0x01
-    ON = 0x02
-    START = 0x03
-
-
-class KeyfobCommands(IntEnum):
-    """Key fob commands"""
-    LOCK = 0x01
-    UNLOCK = 0x02
-    TRUNK = 0x03
-    PANIC = 0x04
-
+counter = Counter()
 
 # =============================================================================
-# CAN Message Classes
+# Frame Builders
 # =============================================================================
 
-@dataclass
-class CanMessage:
-    """CAN message representation"""
-    id: int
-    data: bytes
-    timestamp: float = 0.0
-    
-    def __str__(self) -> str:
-        hex_data = ' '.join(f'{b:02X}' for b in self.data)
-        return f"ID=0x{self.id:03X} [{len(self.data)}] {hex_data}"
+def build_door_cmd(cmd, door_id=0xFF):
+    """Build door command frame"""
+    ctr = counter.get(CAN_ID_DOOR_CMD)
+    data = [cmd, door_id, build_ver_ctr(CAN_SCHEMA_VERSION, ctr), 0]
+    data[3] = calculate_checksum(data[:3])
+    return (CAN_ID_DOOR_CMD, bytes(data))
 
+def build_lighting_cmd(headlight, interior=0):
+    """Build lighting command frame"""
+    ctr = counter.get(CAN_ID_LIGHTING_CMD)
+    data = [headlight, interior, build_ver_ctr(CAN_SCHEMA_VERSION, ctr), 0]
+    data[3] = calculate_checksum(data[:3])
+    return (CAN_ID_LIGHTING_CMD, bytes(data))
+
+def build_turn_cmd(cmd):
+    """Build turn signal command frame"""
+    ctr = counter.get(CAN_ID_TURN_SIGNAL_CMD)
+    data = [cmd, 0, build_ver_ctr(CAN_SCHEMA_VERSION, ctr), 0]
+    data[3] = calculate_checksum(data[:3])
+    return (CAN_ID_TURN_SIGNAL_CMD, bytes(data))
+
+def build_malformed_frame(can_id, error_type):
+    """Build intentionally malformed frame for testing"""
+    if error_type == "wrong_dlc":
+        return (can_id, bytes([0x01, 0x02]))  # Too short
+    elif error_type == "bad_checksum":
+        data = [0x01, 0x00, build_ver_ctr(CAN_SCHEMA_VERSION, 0), 0xFF]
+        return (can_id, bytes(data))
+    elif error_type == "bad_command":
+        ctr = counter.get(can_id)
+        data = [0xFF, 0x00, build_ver_ctr(CAN_SCHEMA_VERSION, ctr), 0]
+        data[3] = calculate_checksum(data[:3])
+        return (can_id, bytes(data))
+    return (can_id, bytes([0]))
 
 # =============================================================================
-# CAN Bus Interface
+# CAN Interface
 # =============================================================================
 
-class CanInterface:
-    """CAN bus interface wrapper"""
-    
-    def __init__(self, channel: str = 'vcan0', bustype: str = 'socketcan'):
-        self.channel = channel
-        self.bustype = bustype
-        self.bus: Optional[can.Bus] = None
-        self.running = False
-        self.rx_callback: Optional[Callable] = None
-        self.rx_thread: Optional[threading.Thread] = None
+class CANInterface:
+    def __init__(self, interface='vcan0'):
+        self.interface = interface
+        self.bus = None
         
-    def connect(self) -> bool:
-        """Connect to CAN bus"""
-        if not CAN_AVAILABLE:
-            print(f"[SIM] Would connect to {self.channel}")
+    def connect(self):
+        if CAN_AVAILABLE:
+            try:
+                self.bus = can.interface.Bus(channel=self.interface, 
+                                             bustype='socketcan')
+                print(f"[CAN] Connected to {self.interface}")
+                return True
+            except Exception as e:
+                print(f"[CAN] Connection failed: {e}")
+                return False
+        else:
+            print(f"[CAN] Simulating connection to {self.interface}")
             return True
-            
-        try:
-            self.bus = can.Bus(channel=self.channel, bustype=self.bustype)
-            print(f"Connected to {self.channel}")
-            return True
-        except Exception as e:
-            print(f"Failed to connect: {e}")
-            return False
     
     def disconnect(self):
-        """Disconnect from CAN bus"""
-        self.running = False
-        if self.rx_thread:
-            self.rx_thread.join(timeout=1.0)
         if self.bus:
             self.bus.shutdown()
             self.bus = None
     
-    def send(self, msg: CanMessage) -> bool:
-        """Send a CAN message"""
-        if not CAN_AVAILABLE:
-            print(f"[TX] {msg}")
-            return True
-            
-        if not self.bus:
-            return False
-            
-        try:
-            can_msg = can.Message(
-                arbitration_id=msg.id,
-                data=msg.data,
-                is_extended_id=False
-            )
-            self.bus.send(can_msg)
-            print(f"[TX] {msg}")
-            return True
-        except Exception as e:
-            print(f"TX Error: {e}")
-            return False
-    
-    def start_receive(self, callback: Callable):
-        """Start receiving messages in background"""
-        self.rx_callback = callback
-        self.running = True
-        self.rx_thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self.rx_thread.start()
-    
-    def _receive_loop(self):
-        """Background receive loop"""
-        while self.running and self.bus:
+    def send(self, can_id, data):
+        if CAN_AVAILABLE and self.bus:
+            msg = can.Message(arbitration_id=can_id, data=data, is_extended_id=False)
             try:
-                msg = self.bus.recv(timeout=0.1)
-                if msg and self.rx_callback:
-                    can_msg = CanMessage(
-                        id=msg.arbitration_id,
-                        data=bytes(msg.data),
-                        timestamp=msg.timestamp
-                    )
-                    self.rx_callback(can_msg)
-            except Exception:
-                pass
+                self.bus.send(msg)
+                return True
+            except Exception as e:
+                print(f"[CAN] Send failed: {e}")
+                return False
+        else:
+            # Simulate
+            return True
+    
+    def receive(self, timeout=0.1):
+        if CAN_AVAILABLE and self.bus:
+            return self.bus.recv(timeout)
+        return None
 
-
-# =============================================================================
-# BCM Simulator
-# =============================================================================
-
-class BcmSimulator:
-    """BCM test simulator"""
-    
-    def __init__(self, interface: CanInterface):
-        self.can = interface
-        self.vehicle_speed = 0
-        self.ignition = IgnitionState.OFF
-        self.ambient_light = 500  # lux
-        self.rain_detected = False
-        self.running = False
-        
-    def start(self):
-        """Start the simulator"""
-        self.running = True
-        self.can.connect()
-        self.can.start_receive(self._on_message_received)
-        
-    def stop(self):
-        """Stop the simulator"""
-        self.running = False
-        self.can.disconnect()
-    
-    def _on_message_received(self, msg: CanMessage):
-        """Handle received CAN message"""
-        print(f"[RX] {msg}")
-        
-        # Parse BCM status messages
-        if msg.id == CanIds.BCM_STATUS:
-            self._parse_bcm_status(msg.data)
-        elif msg.id == CanIds.BCM_HEARTBEAT:
-            self._parse_heartbeat(msg.data)
-    
-    def _parse_bcm_status(self, data: bytes):
-        """Parse BCM status message"""
-        if len(data) >= 8:
-            state = data[0]
-            ign = data[1]
-            doors = data[2]
-            lights = data[3]
-            turn = data[4]
-            speed = (data[5] << 8) | data[6]
-            print(f"  BCM State: {state}, Ignition: {ign}, Speed: {speed} km/h")
-    
-    def _parse_heartbeat(self, data: bytes):
-        """Parse BCM heartbeat message"""
-        if len(data) >= 6:
-            state = data[0]
-            uptime = (data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4]
-            faults = data[5]
-            print(f"  Heartbeat: State={state}, Uptime={uptime}ms, Faults={faults}")
-    
-    # =========================================================================
-    # Command Senders
-    # =========================================================================
-    
-    def send_ignition(self, state: IgnitionState):
-        """Send ignition status"""
-        self.ignition = state
-        msg = CanMessage(CanIds.IGNITION_STATUS, bytes([state]))
-        self.can.send(msg)
-    
-    def send_vehicle_speed(self, speed_kmh: int):
-        """Send vehicle speed"""
-        self.vehicle_speed = speed_kmh
-        data = struct.pack('>H', speed_kmh)
-        msg = CanMessage(CanIds.VEHICLE_SPEED, data)
-        self.can.send(msg)
-    
-    def send_engine_status(self, running: bool):
-        """Send engine status"""
-        msg = CanMessage(CanIds.ENGINE_STATUS, bytes([1 if running else 0]))
-        self.can.send(msg)
-    
-    def send_keyfob(self, cmd: KeyfobCommands):
-        """Send key fob command"""
-        msg = CanMessage(CanIds.KEYFOB_CMD, bytes([cmd]))
-        self.can.send(msg)
-    
-    def send_ambient_light(self, lux: int):
-        """Send ambient light sensor value"""
-        self.ambient_light = lux
-        data = struct.pack('>H', lux)
-        msg = CanMessage(CanIds.AMBIENT_LIGHT, data)
-        self.can.send(msg)
-    
-    def send_rain_sensor(self, detected: bool):
-        """Send rain sensor status"""
-        self.rain_detected = detected
-        msg = CanMessage(CanIds.RAIN_SENSOR, bytes([1 if detected else 0]))
-        self.can.send(msg)
-    
-    def send_door_command(self, cmd: DoorCommands, door: int = 0, extra: int = 0):
-        """Send door control command"""
-        msg = CanMessage(CanIds.DOOR_CMD, bytes([cmd, door, extra]))
-        self.can.send(msg)
-    
-    def send_lighting_command(self, cmd: LightingCommands, param: int = 0):
-        """Send lighting control command"""
-        msg = CanMessage(CanIds.LIGHTING_CMD, bytes([cmd, param]))
-        self.can.send(msg)
-    
-    def send_turn_signal_command(self, cmd: TurnSignalCommands):
-        """Send turn signal command"""
-        msg = CanMessage(CanIds.TURN_SIGNAL_CMD, bytes([cmd]))
-        self.can.send(msg)
-
+def print_frame(direction, can_id, data):
+    """Pretty print a CAN frame"""
+    data_hex = ' '.join(f'{b:02X}' for b in data)
+    print(f"  [{direction}] ID=0x{can_id:03X} [{len(data)}] {data_hex}")
 
 # =============================================================================
-# Interactive Console
+# Scenarios
+# =============================================================================
+
+def scenario_1(can_if):
+    """
+    Scenario 1: Basic operation
+    - Unlock doors
+    - Turn on headlights
+    - Left turn signal
+    """
+    print("\n" + "="*60)
+    print("SCENARIO 1: Basic Operation")
+    print("="*60)
+    
+    steps = [
+        ("Unlock all doors", build_door_cmd(DOOR_CMD_UNLOCK_ALL)),
+        ("Turn on headlights", build_lighting_cmd(HEADLIGHT_CMD_ON)),
+        ("Left turn signal ON", build_turn_cmd(TURN_CMD_LEFT_ON)),
+        ("Wait 2s for flashing...", None),
+        ("Left turn signal OFF", build_turn_cmd(TURN_CMD_OFF)),
+        ("Turn off headlights", build_lighting_cmd(HEADLIGHT_CMD_OFF)),
+        ("Lock all doors", build_door_cmd(DOOR_CMD_LOCK_ALL)),
+    ]
+    
+    for desc, frame in steps:
+        print(f"\n-> {desc}")
+        if frame:
+            can_id, data = frame
+            print_frame("TX", can_id, data)
+            can_if.send(can_id, data)
+        time.sleep(0.5 if frame else 2.0)
+    
+    print("\nScenario 1 complete.\n")
+
+def scenario_2(can_if):
+    """
+    Scenario 2: Hazard lights
+    - Hazard on
+    - Wait for flashing
+    - Hazard off
+    """
+    print("\n" + "="*60)
+    print("SCENARIO 2: Hazard Lights")
+    print("="*60)
+    
+    steps = [
+        ("Hazard lights ON", build_turn_cmd(TURN_CMD_HAZARD_ON)),
+        ("Wait 3s for flashing...", None),
+        ("Hazard lights OFF", build_turn_cmd(TURN_CMD_HAZARD_OFF)),
+    ]
+    
+    for desc, frame in steps:
+        print(f"\n-> {desc}")
+        if frame:
+            can_id, data = frame
+            print_frame("TX", can_id, data)
+            can_if.send(can_id, data)
+        time.sleep(0.5 if frame else 3.0)
+    
+    print("\nScenario 2 complete.\n")
+
+def scenario_3(can_if):
+    """
+    Scenario 3: Malformed frames (fault injection)
+    - Wrong DLC
+    - Bad checksum
+    - Invalid command
+    """
+    print("\n" + "="*60)
+    print("SCENARIO 3: Malformed Frames (Fault Injection)")
+    print("="*60)
+    
+    print("\n-> Sending frame with wrong DLC (should trigger fault)")
+    can_id, data = build_malformed_frame(CAN_ID_DOOR_CMD, "wrong_dlc")
+    print_frame("TX", can_id, data)
+    can_if.send(can_id, data)
+    time.sleep(0.5)
+    
+    print("\n-> Sending frame with bad checksum (should trigger fault)")
+    can_id, data = build_malformed_frame(CAN_ID_LIGHTING_CMD, "bad_checksum")
+    print_frame("TX", can_id, data)
+    can_if.send(can_id, data)
+    time.sleep(0.5)
+    
+    print("\n-> Sending frame with invalid command (should trigger fault)")
+    can_id, data = build_malformed_frame(CAN_ID_TURN_SIGNAL_CMD, "bad_command")
+    print_frame("TX", can_id, data)
+    can_if.send(can_id, data)
+    time.sleep(0.5)
+    
+    print("\n[Expected: BCM should log checksum/counter/invalid command faults]")
+    print("\nScenario 3 complete.\n")
+
+def run_all_scenarios(can_if):
+    """Run all scenarios"""
+    scenario_1(can_if)
+    time.sleep(1)
+    scenario_2(can_if)
+    time.sleep(1)
+    scenario_3(can_if)
+
+# =============================================================================
+# Interactive Mode
 # =============================================================================
 
 def print_help():
-    """Print help message"""
     print("""
-BCM CAN Simulator Commands:
-==========================
-
-Vehicle State:
-  ign <off|acc|on|start>  - Set ignition state
-  speed <kmh>             - Set vehicle speed
-  engine <on|off>         - Set engine status
-  light <lux>             - Set ambient light level
-  rain <on|off>           - Set rain sensor
-
-Key Fob:
-  key <lock|unlock|trunk|panic>
-
-Door Control:
-  door lock               - Lock all doors
-  door unlock             - Unlock all doors
-  door lock <0-3>         - Lock specific door
-  door unlock <0-3>       - Unlock specific door
-  window up <0-3>         - Window up
-  window down <0-3>       - Window down
-  window stop <0-3>       - Stop window
-  child on <2|3>          - Enable child lock
-  child off <2|3>         - Disable child lock
-
-Lighting:
-  head on                 - Headlights on
-  head off                - Headlights off
-  head auto               - Auto headlights
-  high on                 - High beam on
-  high off                - High beam off
-  fog on                  - Fog lights on
-  fog off                 - Fog lights off
-  int on                  - Interior light on
-  int off                 - Interior light off
-  int dim <0-255>         - Set interior brightness
-
-Turn Signals:
-  turn left               - Left turn signal on
-  turn right              - Right turn signal on
-  turn off                - Turn signals off
-  hazard on               - Hazard lights on
-  hazard off              - Hazard lights off
-
-Other:
-  demo                    - Run demo sequence
-  help                    - Show this help
-  quit                    - Exit simulator
+Commands:
+  door lock             - Lock all doors
+  door unlock           - Unlock all doors
+  door lock <0-3>       - Lock single door
+  door unlock <0-3>     - Unlock single door
+  
+  light on              - Headlights on
+  light off             - Headlights off
+  light auto            - Auto headlights
+  light high            - High beam on
+  light low             - High beam off
+  
+  turn left             - Left signal on
+  turn right            - Right signal on
+  turn off              - Turn signals off
+  hazard on             - Hazard on
+  hazard off            - Hazard off
+  
+  scenario <1|2|3|all>  - Run scenario
+  help                  - Show this help
+  quit                  - Exit
 """)
 
-
-def run_interactive(sim: BcmSimulator):
-    """Run interactive console"""
-    print_help()
+def interactive_mode(can_if):
+    print("\nInteractive mode. Type 'help' for commands, 'quit' to exit.\n")
     
     while True:
         try:
-            cmd = input("\n> ").strip().lower()
+            cmd = input("> ").strip().lower()
             parts = cmd.split()
             
             if not parts:
                 continue
             
-            # Ignition
-            if parts[0] == 'ign' and len(parts) > 1:
-                states = {'off': IgnitionState.OFF, 'acc': IgnitionState.ACC,
-                         'on': IgnitionState.ON, 'start': IgnitionState.START}
-                if parts[1] in states:
-                    sim.send_ignition(states[parts[1]])
-            
-            # Speed
-            elif parts[0] == 'speed' and len(parts) > 1:
-                sim.send_vehicle_speed(int(parts[1]))
-            
-            # Engine
-            elif parts[0] == 'engine' and len(parts) > 1:
-                sim.send_engine_status(parts[1] == 'on')
-            
-            # Ambient light
-            elif parts[0] == 'light' and len(parts) > 1:
-                sim.send_ambient_light(int(parts[1]))
-            
-            # Rain
-            elif parts[0] == 'rain' and len(parts) > 1:
-                sim.send_rain_sensor(parts[1] == 'on')
-            
-            # Key fob
-            elif parts[0] == 'key' and len(parts) > 1:
-                cmds = {'lock': KeyfobCommands.LOCK, 'unlock': KeyfobCommands.UNLOCK,
-                       'trunk': KeyfobCommands.TRUNK, 'panic': KeyfobCommands.PANIC}
-                if parts[1] in cmds:
-                    sim.send_keyfob(cmds[parts[1]])
-            
-            # Door commands
+            if parts[0] == 'quit' or parts[0] == 'exit':
+                break
+            elif parts[0] == 'help':
+                print_help()
+            elif parts[0] == 'scenario' and len(parts) > 1:
+                if parts[1] == '1':
+                    scenario_1(can_if)
+                elif parts[1] == '2':
+                    scenario_2(can_if)
+                elif parts[1] == '3':
+                    scenario_3(can_if)
+                elif parts[1] == 'all':
+                    run_all_scenarios(can_if)
             elif parts[0] == 'door' and len(parts) > 1:
                 if parts[1] == 'lock':
                     if len(parts) > 2:
-                        sim.send_door_command(DoorCommands.LOCK_SINGLE, int(parts[2]))
+                        frame = build_door_cmd(DOOR_CMD_LOCK_SINGLE, int(parts[2]))
                     else:
-                        sim.send_door_command(DoorCommands.LOCK_ALL)
+                        frame = build_door_cmd(DOOR_CMD_LOCK_ALL)
+                    print_frame("TX", frame[0], frame[1])
+                    can_if.send(*frame)
                 elif parts[1] == 'unlock':
                     if len(parts) > 2:
-                        sim.send_door_command(DoorCommands.UNLOCK_SINGLE, int(parts[2]))
+                        frame = build_door_cmd(DOOR_CMD_UNLOCK_SINGLE, int(parts[2]))
                     else:
-                        sim.send_door_command(DoorCommands.UNLOCK_ALL)
-            
-            # Window commands
-            elif parts[0] == 'window' and len(parts) > 2:
-                door = int(parts[2])
-                if parts[1] == 'up':
-                    sim.send_door_command(DoorCommands.WINDOW_UP, door)
-                elif parts[1] == 'down':
-                    sim.send_door_command(DoorCommands.WINDOW_DOWN, door)
-                elif parts[1] == 'stop':
-                    sim.send_door_command(DoorCommands.WINDOW_STOP, door)
-            
-            # Child lock
-            elif parts[0] == 'child' and len(parts) > 2:
-                door = int(parts[2])
-                if parts[1] == 'on':
-                    sim.send_door_command(DoorCommands.CHILD_LOCK_ON, door)
-                elif parts[1] == 'off':
-                    sim.send_door_command(DoorCommands.CHILD_LOCK_OFF, door)
-            
-            # Headlights
-            elif parts[0] == 'head' and len(parts) > 1:
-                if parts[1] == 'on':
-                    sim.send_lighting_command(LightingCommands.HEADLIGHTS_ON)
-                elif parts[1] == 'off':
-                    sim.send_lighting_command(LightingCommands.HEADLIGHTS_OFF)
-                elif parts[1] == 'auto':
-                    sim.send_lighting_command(LightingCommands.HEADLIGHTS_AUTO)
-            
-            # High beam
-            elif parts[0] == 'high' and len(parts) > 1:
-                if parts[1] == 'on':
-                    sim.send_lighting_command(LightingCommands.HIGH_BEAM_ON)
-                elif parts[1] == 'off':
-                    sim.send_lighting_command(LightingCommands.HIGH_BEAM_OFF)
-            
-            # Fog lights
-            elif parts[0] == 'fog' and len(parts) > 1:
-                if parts[1] == 'on':
-                    sim.send_lighting_command(LightingCommands.FOG_LIGHTS_ON)
-                elif parts[1] == 'off':
-                    sim.send_lighting_command(LightingCommands.FOG_LIGHTS_OFF)
-            
-            # Interior light
-            elif parts[0] == 'int' and len(parts) > 1:
-                if parts[1] == 'on':
-                    sim.send_lighting_command(LightingCommands.INTERIOR_ON)
-                elif parts[1] == 'off':
-                    sim.send_lighting_command(LightingCommands.INTERIOR_OFF)
-                elif parts[1] == 'dim' and len(parts) > 2:
-                    sim.send_lighting_command(LightingCommands.INTERIOR_DIM, int(parts[2]))
-            
-            # Turn signals
+                        frame = build_door_cmd(DOOR_CMD_UNLOCK_ALL)
+                    print_frame("TX", frame[0], frame[1])
+                    can_if.send(*frame)
+            elif parts[0] == 'light' and len(parts) > 1:
+                cmd_map = {
+                    'on': HEADLIGHT_CMD_ON,
+                    'off': HEADLIGHT_CMD_OFF,
+                    'auto': HEADLIGHT_CMD_AUTO,
+                    'high': HEADLIGHT_CMD_HIGH_ON,
+                    'low': HEADLIGHT_CMD_HIGH_OFF
+                }
+                if parts[1] in cmd_map:
+                    frame = build_lighting_cmd(cmd_map[parts[1]])
+                    print_frame("TX", frame[0], frame[1])
+                    can_if.send(*frame)
             elif parts[0] == 'turn' and len(parts) > 1:
-                if parts[1] == 'left':
-                    sim.send_turn_signal_command(TurnSignalCommands.LEFT_ON)
-                elif parts[1] == 'right':
-                    sim.send_turn_signal_command(TurnSignalCommands.RIGHT_ON)
-                elif parts[1] == 'off':
-                    sim.send_turn_signal_command(TurnSignalCommands.LEFT_OFF)
-            
-            # Hazard
+                cmd_map = {
+                    'left': TURN_CMD_LEFT_ON,
+                    'right': TURN_CMD_RIGHT_ON,
+                    'off': TURN_CMD_OFF
+                }
+                if parts[1] in cmd_map:
+                    frame = build_turn_cmd(cmd_map[parts[1]])
+                    print_frame("TX", frame[0], frame[1])
+                    can_if.send(*frame)
             elif parts[0] == 'hazard' and len(parts) > 1:
                 if parts[1] == 'on':
-                    sim.send_turn_signal_command(TurnSignalCommands.HAZARD_ON)
-                elif parts[1] == 'off':
-                    sim.send_turn_signal_command(TurnSignalCommands.HAZARD_OFF)
-            
-            # Demo
-            elif parts[0] == 'demo':
-                run_demo(sim)
-            
-            # Help
-            elif parts[0] == 'help':
-                print_help()
-            
-            # Quit
-            elif parts[0] in ['quit', 'exit', 'q']:
-                break
-            
+                    frame = build_turn_cmd(TURN_CMD_HAZARD_ON)
+                else:
+                    frame = build_turn_cmd(TURN_CMD_HAZARD_OFF)
+                print_frame("TX", frame[0], frame[1])
+                can_if.send(*frame)
             else:
                 print("Unknown command. Type 'help' for available commands.")
                 
@@ -524,70 +403,54 @@ def run_interactive(sim: BcmSimulator):
         except Exception as e:
             print(f"Error: {e}")
 
-
-def run_demo(sim: BcmSimulator):
-    """Run a demonstration sequence"""
-    print("\n=== Running Demo Sequence ===\n")
-    
-    steps = [
-        ("Setting ignition to ACC", lambda: sim.send_ignition(IgnitionState.ACC)),
-        ("Unlocking doors via key fob", lambda: sim.send_keyfob(KeyfobCommands.UNLOCK)),
-        ("Setting ignition to ON", lambda: sim.send_ignition(IgnitionState.ON)),
-        ("Starting engine", lambda: sim.send_engine_status(True)),
-        ("Accelerating to 20 km/h", lambda: sim.send_vehicle_speed(20)),
-        ("Turning on headlights", lambda: sim.send_lighting_command(LightingCommands.HEADLIGHTS_ON)),
-        ("Left turn signal", lambda: sim.send_turn_signal_command(TurnSignalCommands.LEFT_ON)),
-        ("Turn signal off", lambda: sim.send_turn_signal_command(TurnSignalCommands.LEFT_OFF)),
-        ("Slowing to 0 km/h", lambda: sim.send_vehicle_speed(0)),
-        ("Turning off engine", lambda: sim.send_engine_status(False)),
-        ("Setting ignition to OFF", lambda: sim.send_ignition(IgnitionState.OFF)),
-        ("Locking doors via key fob", lambda: sim.send_keyfob(KeyfobCommands.LOCK)),
-    ]
-    
-    for desc, action in steps:
-        print(f"  {desc}...")
-        action()
-        time.sleep(1.0)
-    
-    print("\n=== Demo Complete ===\n")
-
-
 # =============================================================================
 # Main
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='BCM CAN Bus Simulator')
-    parser.add_argument('--interface', '-i', default='vcan0',
-                       help='CAN interface (default: vcan0)')
-    parser.add_argument('--bustype', '-b', default='socketcan',
-                       help='CAN bus type (default: socketcan)')
-    parser.add_argument('--mode', '-m', choices=['interactive', 'demo'],
-                       default='interactive', help='Run mode')
+    parser = argparse.ArgumentParser(description='BCM CAN Simulator')
+    parser.add_argument('-i', '--interface', default='vcan0',
+                        help='CAN interface (default: vcan0)')
+    parser.add_argument('-s', '--scenario', choices=['1', '2', '3', 'all'],
+                        help='Run scenario')
+    parser.add_argument('--interactive', action='store_true',
+                        help='Interactive mode')
     
     args = parser.parse_args()
     
-    print("BCM CAN Bus Simulator")
-    print("=====================\n")
+    print("="*60)
+    print("BCM CAN Simulator")
+    print("="*60)
     
-    interface = CanInterface(args.interface, args.bustype)
-    sim = BcmSimulator(interface)
+    can_if = CANInterface(args.interface)
+    
+    if not can_if.connect():
+        print("Failed to connect to CAN interface")
+        print("\nTo create a virtual CAN interface:")
+        print("  sudo modprobe vcan")
+        print("  sudo ip link add dev vcan0 type vcan")
+        print("  sudo ip link set up vcan0")
+        sys.exit(1)
     
     try:
-        sim.start()
-        
-        if args.mode == 'demo':
-            run_demo(sim)
+        if args.scenario:
+            if args.scenario == '1':
+                scenario_1(can_if)
+            elif args.scenario == '2':
+                scenario_2(can_if)
+            elif args.scenario == '3':
+                scenario_3(can_if)
+            elif args.scenario == 'all':
+                run_all_scenarios(can_if)
+        elif args.interactive:
+            interactive_mode(can_if)
         else:
-            run_interactive(sim)
-            
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+            print("\nNo action specified. Use --scenario or --interactive")
+            print("Use --help for options\n")
     finally:
-        sim.stop()
+        can_if.disconnect()
     
     print("Goodbye!")
-
 
 if __name__ == '__main__':
     main()

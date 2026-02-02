@@ -1,9 +1,9 @@
 /**
  * @file system_state.h
- * @brief System State Definitions and Types
+ * @brief System State and Common Types
  *
- * This file contains common type definitions, enumerations, and state
- * structures used throughout the BCM system.
+ * Central state repository for all BCM modules.
+ * No dynamic allocation - all state is statically allocated.
  */
 
 #ifndef SYSTEM_STATE_H
@@ -15,167 +15,222 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "can_ids.h"
 
-/* =============================================================================
- * Common Type Definitions
- * ========================================================================== */
+/*******************************************************************************
+ * Configuration
+ ******************************************************************************/
 
-/** Standard result type for BCM operations */
+#define NUM_DOORS                   4U
+#define EVENT_LOG_SIZE              32U     /**< Ring buffer size for events */
+#define CMD_TIMEOUT_MS              5000U   /**< Command timeout in ms */
+#define TURN_SIGNAL_TIMEOUT_MS      30000U  /**< Turn signal auto-off timeout */
+
+/*******************************************************************************
+ * Event Log Entry
+ ******************************************************************************/
+
 typedef enum {
-    BCM_OK = 0,             /**< Operation successful */
-    BCM_ERROR,              /**< General error */
-    BCM_ERROR_INVALID_PARAM,/**< Invalid parameter */
-    BCM_ERROR_TIMEOUT,      /**< Operation timed out */
-    BCM_ERROR_BUSY,         /**< Resource busy */
-    BCM_ERROR_NOT_READY,    /**< System not ready */
-    BCM_ERROR_HW_FAULT,     /**< Hardware fault detected */
-    BCM_ERROR_COMM,         /**< Communication error */
-    BCM_ERROR_BUFFER_FULL,  /**< Buffer full */
-    BCM_ERROR_NOT_SUPPORTED /**< Feature not supported */
-} bcm_result_t;
+    EVENT_NONE = 0,
+    EVENT_DOOR_LOCK_CHANGE,
+    EVENT_DOOR_OPEN_CHANGE,
+    EVENT_HEADLIGHT_CHANGE,
+    EVENT_INTERIOR_CHANGE,
+    EVENT_TURN_SIGNAL_CHANGE,
+    EVENT_FAULT_SET,
+    EVENT_FAULT_CLEAR,
+    EVENT_CMD_RECEIVED,
+    EVENT_CMD_ERROR,
+    EVENT_STATE_CHANGE
+} event_type_t;
 
-/* =============================================================================
- * System State Enumerations
- * ========================================================================== */
+typedef struct {
+    uint32_t        timestamp_ms;   /**< Event timestamp */
+    event_type_t    type;           /**< Event type */
+    uint8_t         data[4];        /**< Event-specific data */
+} event_log_entry_t;
 
-/** BCM operational state */
+/*******************************************************************************
+ * Door Module State
+ ******************************************************************************/
+
 typedef enum {
-    BCM_STATE_INIT = 0,     /**< Initialization state */
-    BCM_STATE_NORMAL,       /**< Normal operation */
-    BCM_STATE_SLEEP,        /**< Low power sleep mode */
-    BCM_STATE_WAKEUP,       /**< Waking up from sleep */
-    BCM_STATE_FAULT,        /**< Fault state */
-    BCM_STATE_DIAGNOSTIC    /**< Diagnostic mode */
-} bcm_state_t;
+    DOOR_STATE_UNLOCKED = 0,
+    DOOR_STATE_LOCKED,
+    DOOR_STATE_LOCKING,     /**< Transition state */
+    DOOR_STATE_UNLOCKING    /**< Transition state */
+} door_lock_state_t;
 
-/** Ignition state */
-typedef enum {
-    IGNITION_OFF = 0,       /**< Ignition off */
-    IGNITION_ACC,           /**< Accessory mode */
-    IGNITION_ON,            /**< Ignition on (run) */
-    IGNITION_START          /**< Engine cranking */
-} ignition_state_t;
+typedef struct {
+    door_lock_state_t   lock_state[NUM_DOORS];
+    bool                is_open[NUM_DOORS];
+    uint32_t            last_cmd_time_ms;
+    uint8_t             last_counter;
+    cmd_result_t        last_result;
+} door_state_t;
 
-/** Door position enumeration */
-typedef enum {
-    DOOR_FRONT_LEFT = 0,    /**< Front left (driver) door */
-    DOOR_FRONT_RIGHT,       /**< Front right (passenger) door */
-    DOOR_REAR_LEFT,         /**< Rear left door */
-    DOOR_REAR_RIGHT,        /**< Rear right door */
-    DOOR_TRUNK,             /**< Trunk/tailgate */
-    DOOR_HOOD,              /**< Hood */
-    DOOR_COUNT_MAX          /**< Maximum door count */
-} door_position_t;
+/*******************************************************************************
+ * Lighting Module State
+ ******************************************************************************/
 
-/** Lock state */
 typedef enum {
-    LOCK_STATE_UNKNOWN = 0, /**< Lock state unknown */
-    LOCK_STATE_UNLOCKED,    /**< Door unlocked */
-    LOCK_STATE_LOCKED,      /**< Door locked */
-    LOCK_STATE_MOVING       /**< Lock actuator moving */
-} lock_state_t;
+    LIGHTING_STATE_OFF = 0,
+    LIGHTING_STATE_ON,
+    LIGHTING_STATE_AUTO
+} lighting_mode_state_t;
 
-/** Window state */
-typedef enum {
-    WINDOW_STATE_UNKNOWN = 0,   /**< Window position unknown */
-    WINDOW_STATE_CLOSED,        /**< Window fully closed */
-    WINDOW_STATE_OPEN,          /**< Window fully open */
-    WINDOW_STATE_PARTIAL,       /**< Window partially open */
-    WINDOW_STATE_MOVING_UP,     /**< Window moving up */
-    WINDOW_STATE_MOVING_DOWN,   /**< Window moving down */
-    WINDOW_STATE_BLOCKED        /**< Window blocked (anti-pinch) */
-} window_state_t;
+typedef struct {
+    lighting_mode_state_t   headlight_mode;
+    headlight_state_t       headlight_output;   /**< Actual output state */
+    bool                    high_beam_active;
+    lighting_mode_state_t   interior_mode;
+    uint8_t                 interior_brightness; /**< 0-15 */
+    bool                    interior_on;
+    uint8_t                 ambient_light;      /**< Scaled 0-255 */
+    uint32_t                last_cmd_time_ms;
+    uint8_t                 last_counter;
+    cmd_result_t            last_result;
+} lighting_state_t;
 
-/** Light state */
-typedef enum {
-    LIGHT_OFF = 0,          /**< Light is off */
-    LIGHT_ON,               /**< Light is on (full brightness) */
-    LIGHT_DIMMED,           /**< Light is dimmed */
-    LIGHT_FLASHING,         /**< Light is flashing */
-    LIGHT_FAULT             /**< Light fault detected */
-} light_state_t;
+/*******************************************************************************
+ * Turn Signal Module State
+ ******************************************************************************/
 
-/** Turn signal state */
 typedef enum {
-    TURN_SIGNAL_OFF = 0,    /**< Turn signal off */
-    TURN_SIGNAL_LEFT,       /**< Left turn signal active */
-    TURN_SIGNAL_RIGHT,      /**< Right turn signal active */
-    TURN_SIGNAL_HAZARD      /**< Hazard lights active */
+    TURN_SIG_STATE_OFF = 0,
+    TURN_SIG_STATE_LEFT,
+    TURN_SIG_STATE_RIGHT,
+    TURN_SIG_STATE_HAZARD
+} turn_signal_mode_t;
+
+typedef struct {
+    turn_signal_mode_t  mode;
+    bool                left_output;    /**< Current flash state */
+    bool                right_output;   /**< Current flash state */
+    uint8_t             flash_count;    /**< Wrapping counter */
+    uint32_t            last_toggle_ms; /**< Last flash toggle time */
+    uint32_t            last_cmd_time_ms;
+    uint8_t             last_counter;
+    cmd_result_t        last_result;
 } turn_signal_state_t;
 
-/* =============================================================================
- * State Structures
- * ========================================================================== */
+/*******************************************************************************
+ * Fault Manager State
+ ******************************************************************************/
 
-/** Door status structure */
-typedef struct {
-    lock_state_t lock_state;        /**< Current lock state */
-    window_state_t window_state;    /**< Current window state */
-    uint8_t window_position;        /**< Window position 0-100% */
-    bool is_open;                   /**< Door open sensor */
-    bool child_lock_active;         /**< Child lock engaged */
-} door_status_t;
+#define MAX_ACTIVE_FAULTS           8U
 
-/** Lighting status structure */
 typedef struct {
-    light_state_t headlights;       /**< Headlight state */
-    light_state_t high_beam;        /**< High beam state */
-    light_state_t fog_lights;       /**< Fog light state */
-    light_state_t tail_lights;      /**< Tail light state */
-    light_state_t interior;         /**< Interior light state */
-    uint8_t interior_brightness;    /**< Interior brightness 0-255 */
-    bool auto_mode_active;          /**< Auto headlight mode */
-} lighting_status_t;
+    fault_code_t    code;
+    uint32_t        timestamp_ms;
+} fault_entry_t;
 
-/** Turn signal status structure */
 typedef struct {
-    turn_signal_state_t state;      /**< Current turn signal state */
-    bool left_bulb_ok;              /**< Left bulb status */
-    bool right_bulb_ok;             /**< Right bulb status */
-    uint8_t blink_count;            /**< Current blink count */
-    bool output_state;              /**< Current output (on/off) */
-} turn_signal_status_t;
+    uint8_t         flags1;             /**< Active fault flags byte 1 */
+    uint8_t         flags2;             /**< Active fault flags byte 2 */
+    fault_entry_t   active_faults[MAX_ACTIVE_FAULTS];
+    uint8_t         active_count;
+    uint8_t         total_count;        /**< Historical count */
+    fault_code_t    most_recent_code;
+    uint32_t        most_recent_time_ms;
+} fault_state_t;
 
-/** Vehicle state structure (from CAN) */
-typedef struct {
-    ignition_state_t ignition;      /**< Current ignition state */
-    uint16_t vehicle_speed_kmh;     /**< Vehicle speed in km/h */
-    bool engine_running;            /**< Engine running status */
-    uint16_t ambient_light_lux;     /**< Ambient light in lux */
-    bool rain_detected;             /**< Rain sensor status */
-} vehicle_state_t;
+/*******************************************************************************
+ * Event Log Ring Buffer
+ ******************************************************************************/
 
-/** Complete BCM state structure */
 typedef struct {
-    bcm_state_t bcm_state;          /**< BCM operational state */
-    vehicle_state_t vehicle;        /**< Vehicle state from CAN */
-    door_status_t doors[DOOR_COUNT_MAX]; /**< Door status array */
-    lighting_status_t lighting;     /**< Lighting status */
-    turn_signal_status_t turn_signal; /**< Turn signal status */
-    uint32_t uptime_ms;             /**< System uptime in ms */
-    uint16_t active_faults;         /**< Number of active faults */
+    event_log_entry_t   entries[EVENT_LOG_SIZE];
+    uint8_t             head;           /**< Next write position */
+    uint8_t             count;          /**< Number of valid entries */
+} event_log_t;
+
+/*******************************************************************************
+ * Complete System State
+ ******************************************************************************/
+
+typedef struct {
+    /* BCM Core State */
+    bcm_state_t         bcm_state;
+    uint32_t            uptime_ms;
+    uint8_t             uptime_minutes;     /**< Wrapping minutes counter */
+    
+    /* Rolling counters for TX messages */
+    uint8_t             tx_counter_door;
+    uint8_t             tx_counter_lighting;
+    uint8_t             tx_counter_turn;
+    uint8_t             tx_counter_fault;
+    uint8_t             tx_counter_heartbeat;
+    
+    /* Module States */
+    door_state_t        door;
+    lighting_state_t    lighting;
+    turn_signal_state_t turn_signal;
+    fault_state_t       fault;
+    
+    /* Event Log */
+    event_log_t         event_log;
+    
+    /* Timing for periodic tasks */
+    uint32_t            last_10ms_tick;
+    uint32_t            last_100ms_tick;
+    uint32_t            last_1000ms_tick;
+    
 } system_state_t;
 
-/* =============================================================================
+/*******************************************************************************
  * Global State Access
- * ========================================================================== */
+ ******************************************************************************/
 
 /**
- * @brief Get pointer to the global system state
- * @return Pointer to system state structure
+ * @brief Get pointer to global system state (read-only)
  */
-const system_state_t* system_state_get(void);
+const system_state_t* sys_state_get(void);
 
 /**
- * @brief Get modifiable pointer to system state (internal use)
- * @return Pointer to system state structure
+ * @brief Get mutable pointer to global system state (internal use)
  */
-system_state_t* system_state_get_mutable(void);
+system_state_t* sys_state_get_mut(void);
 
 /**
  * @brief Initialize system state to defaults
  */
-void system_state_init(void);
+void sys_state_init(void);
+
+/**
+ * @brief Update uptime based on current tick
+ * @param current_ms Current millisecond tick
+ */
+void sys_state_update_time(uint32_t current_ms);
+
+/*******************************************************************************
+ * Event Log Functions
+ ******************************************************************************/
+
+/**
+ * @brief Log an event
+ * @param type Event type
+ * @param data Event data (4 bytes, can be NULL)
+ */
+void event_log_add(event_type_t type, const uint8_t *data);
+
+/**
+ * @brief Get event at index (0 = oldest)
+ * @param index Index into log
+ * @param entry Output entry
+ * @return true if valid entry returned
+ */
+bool event_log_get(uint8_t index, event_log_entry_t *entry);
+
+/**
+ * @brief Get number of events in log
+ */
+uint8_t event_log_count(void);
+
+/**
+ * @brief Clear event log
+ */
+void event_log_clear(void);
 
 #ifdef __cplusplus
 }

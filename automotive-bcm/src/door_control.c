@@ -2,506 +2,314 @@
  * @file door_control.c
  * @brief Door Control Module Implementation
  *
- * Implements door lock, window control, and related features.
+ * State machine: UNLOCKED <-> LOCKING -> LOCKED <-> UNLOCKING -> UNLOCKED
  */
 
 #include <string.h>
+#include <stdio.h>
 #include "door_control.h"
 #include "fault_manager.h"
-#include "lighting_control.h"
-#include "bcm_config.h"
 #include "can_ids.h"
 
-/* =============================================================================
+/*******************************************************************************
  * Private Definitions
- * ========================================================================== */
+ ******************************************************************************/
 
-/** Door control state */
-typedef struct {
-    bool initialized;
-    bool auto_lock_enabled;
-    uint16_t vehicle_speed;
-    bool speed_lock_triggered;
-    uint32_t last_unlock_time;
-    uint32_t window_move_start[DOOR_COUNT_MAX];
-    bool window_moving[DOOR_COUNT_MAX];
-    bool window_one_touch[DOOR_COUNT_MAX];
-} door_control_state_t;
+#define DOOR_TRANSITION_TIME_MS     50U     /**< Time to complete lock/unlock */
 
-static door_control_state_t g_door_state;
-
-/* =============================================================================
- * Private Helper Functions
- * ========================================================================== */
+/*******************************************************************************
+ * Private Functions
+ ******************************************************************************/
 
 /**
- * @brief Validate door position parameter
+ * @brief Validate door command frame
+ * @return cmd_result_t
  */
-static bool is_valid_door(door_position_t door)
+static cmd_result_t validate_door_cmd(const can_frame_t *frame)
 {
-    return (door >= DOOR_FRONT_LEFT && door < DOOR_COUNT_MAX);
+    system_state_t *state = sys_state_get_mut();
+    
+    /* Check DLC */
+    if (frame->dlc != DOOR_CMD_DLC) {
+        fault_manager_set(FAULT_CODE_INVALID_LENGTH);
+        return CMD_RESULT_INVALID_CMD;
+    }
+    
+    /* Extract fields */
+    uint8_t cmd = frame->data[DOOR_CMD_BYTE_CMD];
+    uint8_t door_id = frame->data[DOOR_CMD_BYTE_DOOR_ID];
+    uint8_t ver_ctr = frame->data[DOOR_CMD_BYTE_VER_CTR];
+    uint8_t checksum = frame->data[DOOR_CMD_BYTE_CHECKSUM];
+    
+    /* Validate checksum */
+    uint8_t calc_checksum = can_calculate_checksum(frame->data, DOOR_CMD_DLC - 1);
+    if (checksum != calc_checksum) {
+        fault_manager_set(FAULT_CODE_INVALID_CHECKSUM);
+        return CMD_RESULT_CHECKSUM_ERROR;
+    }
+    
+    /* Validate counter */
+    uint8_t counter = CAN_GET_COUNTER(ver_ctr);
+    if (state->door.last_cmd_time_ms > 0) {
+        if (!can_validate_counter(counter, state->door.last_counter)) {
+            fault_manager_set(FAULT_CODE_INVALID_COUNTER);
+            return CMD_RESULT_COUNTER_ERROR;
+        }
+    }
+    state->door.last_counter = counter;
+    
+    /* Validate command value */
+    if (cmd == 0 || cmd > DOOR_CMD_MAX) {
+        fault_manager_set(FAULT_CODE_INVALID_CMD);
+        return CMD_RESULT_INVALID_CMD;
+    }
+    
+    /* Validate door ID for single door commands */
+    if ((cmd == DOOR_CMD_LOCK_SINGLE || cmd == DOOR_CMD_UNLOCK_SINGLE) &&
+        door_id > DOOR_ID_MAX) {
+        fault_manager_set(FAULT_CODE_INVALID_CMD);
+        return CMD_RESULT_INVALID_CMD;
+    }
+    
+    return CMD_RESULT_OK;
 }
 
 /**
- * @brief Actuate door lock hardware
+ * @brief Log door state change event
  */
-static bcm_result_t actuate_lock(door_position_t door, bool lock)
+static void log_door_event(uint8_t door_id, door_lock_state_t new_state)
 {
-    system_state_t *state = system_state_get_mutable();
-    
-    if (!is_valid_door(door)) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    /* Set lock state */
-    state->doors[door].lock_state = lock ? LOCK_STATE_LOCKED : LOCK_STATE_UNLOCKED;
-    
-    /* In real implementation, drive GPIO here */
-    
-    return BCM_OK;
+    uint8_t data[4] = { door_id, (uint8_t)new_state, 0, 0 };
+    event_log_add(EVENT_DOOR_LOCK_CHANGE, data);
 }
 
-/**
- * @brief Actuate window motor
- */
-static bcm_result_t actuate_window(door_position_t door, int8_t direction)
+/*******************************************************************************
+ * Public Functions
+ ******************************************************************************/
+
+void door_control_init(void)
 {
-    system_state_t *state = system_state_get_mutable();
+    system_state_t *state = sys_state_get_mut();
     
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT) {
-        return BCM_ERROR_INVALID_PARAM;
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        state->door.lock_state[i] = DOOR_STATE_UNLOCKED;
+        state->door.is_open[i] = false;
     }
     
-    if (direction > 0) {
-        state->doors[door].window_state = WINDOW_STATE_MOVING_UP;
-    } else if (direction < 0) {
-        state->doors[door].window_state = WINDOW_STATE_MOVING_DOWN;
-    } else {
-        /* Determine final state based on position */
-        if (state->doors[door].window_position >= 100) {
-            state->doors[door].window_state = WINDOW_STATE_CLOSED;
-        } else if (state->doors[door].window_position == 0) {
-            state->doors[door].window_state = WINDOW_STATE_OPEN;
-        } else {
-            state->doors[door].window_state = WINDOW_STATE_PARTIAL;
-        }
-    }
+    state->door.last_cmd_time_ms = 0;
+    state->door.last_counter = 0;
+    state->door.last_result = CMD_RESULT_OK;
     
-    return BCM_OK;
+    printf("[DOOR] Initialized\n");
 }
 
-/* =============================================================================
- * Initialization
- * ========================================================================== */
-
-bcm_result_t door_control_init(void)
+cmd_result_t door_control_handle_cmd(const can_frame_t *frame)
 {
-    memset(&g_door_state, 0, sizeof(g_door_state));
-    g_door_state.auto_lock_enabled = true;
-    g_door_state.initialized = true;
-    
-    return BCM_OK;
-}
-
-void door_control_deinit(void)
-{
-    /* Stop any window motors */
-    for (int i = 0; i <= DOOR_REAR_RIGHT; i++) {
-        if (g_door_state.window_moving[i]) {
-            actuate_window((door_position_t)i, 0);
-        }
+    if (frame == NULL || frame->id != CAN_ID_DOOR_CMD) {
+        return CMD_RESULT_INVALID_CMD;
     }
     
-    g_door_state.initialized = false;
-}
-
-/* =============================================================================
- * Processing
- * ========================================================================== */
-
-bcm_result_t door_control_process(uint32_t timestamp_ms)
-{
-    system_state_t *state = system_state_get_mutable();
+    system_state_t *state = sys_state_get_mut();
     
-    if (!g_door_state.initialized) {
-        return BCM_ERROR_NOT_READY;
+    /* Validate frame */
+    cmd_result_t result = validate_door_cmd(frame);
+    if (result != CMD_RESULT_OK) {
+        state->door.last_result = result;
+        
+        uint8_t data[4] = { (uint8_t)result, frame->data[0], 0, 0 };
+        event_log_add(EVENT_CMD_ERROR, data);
+        
+        printf("[DOOR] Command error: %d\n", result);
+        return result;
     }
     
-    /* Auto-lock feature */
-    if (g_door_state.auto_lock_enabled && !g_door_state.speed_lock_triggered) {
-        if (g_door_state.vehicle_speed >= DOOR_AUTO_LOCK_SPEED_KMH) {
-            door_lock_all();
-            g_door_state.speed_lock_triggered = true;
-        }
-    }
+    /* Process command */
+    uint8_t cmd = frame->data[DOOR_CMD_BYTE_CMD];
+    uint8_t door_id = frame->data[DOOR_CMD_BYTE_DOOR_ID];
     
-    /* Reset speed lock when stopped */
-    if (g_door_state.vehicle_speed == 0) {
-        g_door_state.speed_lock_triggered = false;
-    }
+    state->door.last_cmd_time_ms = state->uptime_ms;
     
-    /* Process window movements */
-    for (int i = 0; i <= DOOR_REAR_RIGHT; i++) {
-        if (g_door_state.window_moving[i]) {
-            uint32_t elapsed = timestamp_ms - g_door_state.window_move_start[i];
+    switch (cmd) {
+        case DOOR_CMD_LOCK_ALL:
+            door_control_lock_all();
+            break;
             
-            /* Check for timeout */
-            if (elapsed >= DOOR_WINDOW_MOTOR_TIMEOUT_MS) {
-                actuate_window((door_position_t)i, 0);
-                g_door_state.window_moving[i] = false;
-                fault_report((fault_code_t)(FAULT_DOOR_WINDOW_FL_MOTOR + (uint16_t)i), 
-                            FAULT_SEVERITY_WARNING);
-            }
+        case DOOR_CMD_UNLOCK_ALL:
+            door_control_unlock_all();
+            break;
             
-            /* Simulate window movement */
-            if (state->doors[i].window_state == WINDOW_STATE_MOVING_UP) {
-                if (state->doors[i].window_position < 100) {
-                    state->doors[i].window_position++;
-                } else {
-                    actuate_window((door_position_t)i, 0);
-                    g_door_state.window_moving[i] = false;
-                }
-            } else if (state->doors[i].window_state == WINDOW_STATE_MOVING_DOWN) {
-                if (state->doors[i].window_position > 0) {
-                    state->doors[i].window_position--;
-                } else {
-                    actuate_window((door_position_t)i, 0);
-                    g_door_state.window_moving[i] = false;
-                }
-            }
-        }
+        case DOOR_CMD_LOCK_SINGLE:
+            door_control_lock(door_id);
+            break;
+            
+        case DOOR_CMD_UNLOCK_SINGLE:
+            door_control_unlock(door_id);
+            break;
+            
+        default:
+            result = CMD_RESULT_INVALID_CMD;
+            break;
     }
     
-    return BCM_OK;
-}
-
-/* =============================================================================
- * Lock Control
- * ========================================================================== */
-
-bcm_result_t door_lock_all(void)
-{
-    bcm_result_t result = BCM_OK;
+    state->door.last_result = result;
     
-    for (int i = DOOR_FRONT_LEFT; i <= DOOR_REAR_RIGHT; i++) {
-        bcm_result_t r = actuate_lock((door_position_t)i, true);
-        if (r != BCM_OK) {
-            result = r;
-        }
-    }
+    uint8_t data[4] = { cmd, door_id, 0, 0 };
+    event_log_add(EVENT_CMD_RECEIVED, data);
     
     return result;
 }
 
-bcm_result_t door_unlock_all(void)
+void door_control_update(uint32_t current_ms)
 {
-    bcm_result_t result = BCM_OK;
+    system_state_t *state = sys_state_get_mut();
     
-    for (int i = DOOR_FRONT_LEFT; i <= DOOR_REAR_RIGHT; i++) {
-        bcm_result_t r = actuate_lock((door_position_t)i, false);
-        if (r != BCM_OK) {
-            result = r;
+    /* Process state transitions */
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        switch (state->door.lock_state[i]) {
+            case DOOR_STATE_LOCKING:
+                /* Transition to LOCKED after delay */
+                state->door.lock_state[i] = DOOR_STATE_LOCKED;
+                log_door_event(i, DOOR_STATE_LOCKED);
+                printf("[DOOR] Door %d: LOCKED\n", i);
+                break;
+                
+            case DOOR_STATE_UNLOCKING:
+                /* Transition to UNLOCKED after delay */
+                state->door.lock_state[i] = DOOR_STATE_UNLOCKED;
+                log_door_event(i, DOOR_STATE_UNLOCKED);
+                printf("[DOOR] Door %d: UNLOCKED\n", i);
+                break;
+                
+            default:
+                /* No transition needed */
+                break;
         }
     }
     
-    /* Trigger welcome lights */
-    lighting_trigger_welcome_lights();
+    (void)current_ms;
+}
+
+void door_control_build_status_frame(can_frame_t *frame)
+{
+    const system_state_t *state = sys_state_get();
+    system_state_t *mut_state = sys_state_get_mut();
     
-    return result;
+    memset(frame, 0, sizeof(can_frame_t));
+    frame->id = CAN_ID_DOOR_STATUS;
+    frame->dlc = DOOR_STATUS_DLC;
+    
+    /* Byte 0: Lock states */
+    uint8_t locks = 0;
+    if (state->door.lock_state[0] == DOOR_STATE_LOCKED) locks |= DOOR_LOCK_BIT_FL;
+    if (state->door.lock_state[1] == DOOR_STATE_LOCKED) locks |= DOOR_LOCK_BIT_FR;
+    if (state->door.lock_state[2] == DOOR_STATE_LOCKED) locks |= DOOR_LOCK_BIT_RL;
+    if (state->door.lock_state[3] == DOOR_STATE_LOCKED) locks |= DOOR_LOCK_BIT_RR;
+    frame->data[DOOR_STATUS_BYTE_LOCKS] = locks;
+    
+    /* Byte 1: Open states */
+    uint8_t opens = 0;
+    if (state->door.is_open[0]) opens |= DOOR_OPEN_BIT_FL;
+    if (state->door.is_open[1]) opens |= DOOR_OPEN_BIT_FR;
+    if (state->door.is_open[2]) opens |= DOOR_OPEN_BIT_RL;
+    if (state->door.is_open[3]) opens |= DOOR_OPEN_BIT_RR;
+    frame->data[DOOR_STATUS_BYTE_OPENS] = opens;
+    
+    /* Byte 2: Last command result */
+    frame->data[DOOR_STATUS_BYTE_RESULT] = (uint8_t)state->door.last_result;
+    
+    /* Byte 3: Active fault count */
+    frame->data[DOOR_STATUS_BYTE_FAULTS] = fault_manager_get_count();
+    
+    /* Byte 4: Version and counter */
+    frame->data[DOOR_STATUS_BYTE_VER_CTR] = CAN_BUILD_VER_CTR(
+        CAN_SCHEMA_VERSION, mut_state->tx_counter_door);
+    mut_state->tx_counter_door = (mut_state->tx_counter_door + 1) & CAN_COUNTER_MASK;
+    
+    /* Byte 5: Checksum */
+    frame->data[DOOR_STATUS_BYTE_CHECKSUM] = can_calculate_checksum(
+        frame->data, DOOR_STATUS_DLC - 1);
 }
 
-bcm_result_t door_lock(door_position_t door)
+door_lock_state_t door_control_get_lock_state(uint8_t door_id)
 {
-    return actuate_lock(door, true);
-}
-
-bcm_result_t door_unlock(door_position_t door)
-{
-    return actuate_lock(door, false);
-}
-
-lock_state_t door_get_lock_state(door_position_t door)
-{
-    if (!is_valid_door(door)) {
-        return LOCK_STATE_UNKNOWN;
+    if (door_id >= NUM_DOORS) {
+        return DOOR_STATE_UNLOCKED;
     }
-    return system_state_get()->doors[door].lock_state;
+    return sys_state_get()->door.lock_state[door_id];
 }
 
-bool door_all_locked(void)
+bool door_control_all_locked(void)
 {
-    const system_state_t *state = system_state_get();
+    const system_state_t *state = sys_state_get();
     
-    for (int i = DOOR_FRONT_LEFT; i <= DOOR_REAR_RIGHT; i++) {
-        if (state->doors[i].lock_state != LOCK_STATE_LOCKED) {
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        if (state->door.lock_state[i] != DOOR_STATE_LOCKED) {
             return false;
         }
     }
     return true;
 }
 
-bool door_any_unlocked(void)
+bool door_control_any_open(void)
 {
-    const system_state_t *state = system_state_get();
+    const system_state_t *state = sys_state_get();
     
-    for (int i = DOOR_FRONT_LEFT; i <= DOOR_REAR_RIGHT; i++) {
-        if (state->doors[i].lock_state == LOCK_STATE_UNLOCKED) {
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        if (state->door.is_open[i]) {
             return true;
         }
     }
     return false;
 }
 
-/* =============================================================================
- * Window Control
- * ========================================================================== */
-
-bcm_result_t door_window_open(door_position_t door, bool one_touch)
+void door_control_lock_all(void)
 {
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
+    system_state_t *state = sys_state_get_mut();
     
-    g_door_state.window_moving[(int)door] = true;
-    g_door_state.window_one_touch[(int)door] = one_touch;
-    g_door_state.window_move_start[(int)door] = system_state_get()->uptime_ms;
-    
-    return actuate_window(door, -1);
-}
-
-bcm_result_t door_window_close(door_position_t door, bool one_touch)
-{
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    g_door_state.window_moving[(int)door] = true;
-    g_door_state.window_one_touch[(int)door] = one_touch;
-    g_door_state.window_move_start[(int)door] = system_state_get()->uptime_ms;
-    
-    return actuate_window(door, 1);
-}
-
-bcm_result_t door_window_stop(door_position_t door)
-{
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    g_door_state.window_moving[(int)door] = false;
-    return actuate_window(door, 0);
-}
-
-bcm_result_t door_window_set_position(door_position_t door, uint8_t position)
-{
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT || position > 100) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    uint8_t current = system_state_get()->doors[door].window_position;
-    
-    if (position > current) {
-        return door_window_close(door, true);
-    } else if (position < current) {
-        return door_window_open(door, true);
-    }
-    
-    return BCM_OK;
-}
-
-uint8_t door_window_get_position(door_position_t door)
-{
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT) {
-        return 0xFF;
-    }
-    return system_state_get()->doors[door].window_position;
-}
-
-window_state_t door_window_get_state(door_position_t door)
-{
-    if (!is_valid_door(door) || door > DOOR_REAR_RIGHT) {
-        return WINDOW_STATE_UNKNOWN;
-    }
-    return system_state_get()->doors[door].window_state;
-}
-
-bcm_result_t door_window_close_all(void)
-{
-    bcm_result_t result = BCM_OK;
-    
-    for (int i = DOOR_FRONT_LEFT; i <= DOOR_REAR_RIGHT; i++) {
-        bcm_result_t r = door_window_close((door_position_t)i, true);
-        if (r != BCM_OK) {
-            result = r;
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        if (state->door.lock_state[i] == DOOR_STATE_UNLOCKED) {
+            state->door.lock_state[i] = DOOR_STATE_LOCKING;
+            printf("[DOOR] Door %d: LOCKING\n", i);
         }
     }
-    
-    return result;
 }
 
-/* =============================================================================
- * Door Status
- * ========================================================================== */
-
-bool door_is_open(door_position_t door)
+void door_control_unlock_all(void)
 {
-    if (!is_valid_door(door)) {
-        return false;
-    }
-    return system_state_get()->doors[door].is_open;
-}
-
-bool door_any_open(void)
-{
-    const system_state_t *state = system_state_get();
+    system_state_t *state = sys_state_get_mut();
     
-    for (int i = 0; i < DOOR_COUNT_MAX; i++) {
-        if (state->doors[i].is_open) {
-            return true;
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        if (state->door.lock_state[i] == DOOR_STATE_LOCKED) {
+            state->door.lock_state[i] = DOOR_STATE_UNLOCKING;
+            printf("[DOOR] Door %d: UNLOCKING\n", i);
         }
     }
-    return false;
 }
 
-bcm_result_t door_get_status(door_position_t door, door_status_t *status)
+void door_control_lock(uint8_t door_id)
 {
-    if (!is_valid_door(door) || !status) {
-        return BCM_ERROR_INVALID_PARAM;
+    if (door_id >= NUM_DOORS) {
+        return;
     }
     
-    *status = system_state_get()->doors[door];
-    return BCM_OK;
-}
-
-/* =============================================================================
- * Child Safety Lock
- * ========================================================================== */
-
-bcm_result_t door_child_lock_enable(door_position_t door)
-{
-    if (door != DOOR_REAR_LEFT && door != DOOR_REAR_RIGHT) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
+    system_state_t *state = sys_state_get_mut();
     
-    system_state_get_mutable()->doors[door].child_lock_active = true;
-    return BCM_OK;
-}
-
-bcm_result_t door_child_lock_disable(door_position_t door)
-{
-    if (door != DOOR_REAR_LEFT && door != DOOR_REAR_RIGHT) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    system_state_get_mutable()->doors[door].child_lock_active = false;
-    return BCM_OK;
-}
-
-bool door_child_lock_active(door_position_t door)
-{
-    if (!is_valid_door(door)) {
-        return false;
-    }
-    return system_state_get()->doors[door].child_lock_active;
-}
-
-/* =============================================================================
- * Auto-Lock Feature
- * ========================================================================== */
-
-void door_auto_lock_enable(bool enable)
-{
-    g_door_state.auto_lock_enabled = enable;
-}
-
-bool door_auto_lock_enabled(void)
-{
-    return g_door_state.auto_lock_enabled;
-}
-
-void door_update_vehicle_speed(uint16_t speed_kmh)
-{
-    g_door_state.vehicle_speed = speed_kmh;
-}
-
-/* =============================================================================
- * CAN Message Handling
- * ========================================================================== */
-
-bcm_result_t door_control_handle_can_cmd(const uint8_t *data, uint8_t len)
-{
-    if (!data || len < 1) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    uint8_t cmd = data[0];
-    door_position_t door = (len > 1) ? (door_position_t)data[1] : DOOR_FRONT_LEFT;
-    
-    switch (cmd) {
-        case DOOR_CMD_LOCK_ALL:
-            return door_lock_all();
-            
-        case DOOR_CMD_UNLOCK_ALL:
-            return door_unlock_all();
-            
-        case DOOR_CMD_LOCK_SINGLE:
-            return door_lock(door);
-            
-        case DOOR_CMD_UNLOCK_SINGLE:
-            return door_unlock(door);
-            
-        case DOOR_CMD_WINDOW_UP:
-            return door_window_close(door, (len > 2) && data[2]);
-            
-        case DOOR_CMD_WINDOW_DOWN:
-            return door_window_open(door, (len > 2) && data[2]);
-            
-        case DOOR_CMD_WINDOW_STOP:
-            return door_window_stop(door);
-            
-        case DOOR_CMD_CHILD_LOCK_ON:
-            return door_child_lock_enable(door);
-            
-        case DOOR_CMD_CHILD_LOCK_OFF:
-            return door_child_lock_disable(door);
-            
-        default:
-            return BCM_ERROR_INVALID_PARAM;
+    if (state->door.lock_state[door_id] == DOOR_STATE_UNLOCKED) {
+        state->door.lock_state[door_id] = DOOR_STATE_LOCKING;
+        printf("[DOOR] Door %d: LOCKING\n", door_id);
     }
 }
 
-void door_control_get_can_status(uint8_t *data, uint8_t *len)
+void door_control_unlock(uint8_t door_id)
 {
-    const system_state_t *state = system_state_get();
-    
-    /* Byte 0: Lock states (bit field) */
-    data[0] = 0;
-    for (int i = 0; i < 4; i++) {
-        if (state->doors[i].lock_state == LOCK_STATE_LOCKED) {
-            data[0] |= (uint8_t)(1U << (uint8_t)i);
-        }
+    if (door_id >= NUM_DOORS) {
+        return;
     }
     
-    /* Byte 1: Door open states (bit field) */
-    data[1] = 0;
-    for (int i = 0; i < DOOR_COUNT_MAX; i++) {
-        if (state->doors[i].is_open) {
-            data[1] |= (uint8_t)(1U << (uint8_t)i);
-        }
+    system_state_t *state = sys_state_get_mut();
+    
+    if (state->door.lock_state[door_id] == DOOR_STATE_LOCKED) {
+        state->door.lock_state[door_id] = DOOR_STATE_UNLOCKING;
+        printf("[DOOR] Door %d: UNLOCKING\n", door_id);
     }
-    
-    /* Bytes 2-5: Window positions */
-    for (int i = 0; i < 4; i++) {
-        data[2 + i] = state->doors[i].window_position;
-    }
-    
-    /* Byte 6: Child locks */
-    data[6] = 0;
-    if (state->doors[DOOR_REAR_LEFT].child_lock_active) data[6] |= 0x01;
-    if (state->doors[DOOR_REAR_RIGHT].child_lock_active) data[6] |= 0x02;
-    
-    /* Byte 7: Reserved */
-    data[7] = 0;
-    
-    *len = 8;
 }

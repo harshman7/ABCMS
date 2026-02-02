@@ -1,168 +1,264 @@
 # Automotive Body Control Module (BCM)
 
-A production-grade Body Control Module implementation for automotive applications, written in C11. This module manages vehicle body functions including door control, lighting, turn signals, and fault management via CAN bus communication.
+A production-grade Body Control Module implementation written in C11. Features message-driven architecture with explicit state machines, CAN bus communication, and comprehensive testing.
 
 ## Features
 
-- **Door Control**: Lock/unlock, window control, child safety lock
-- **Lighting Control**: Headlights, tail lights, interior lights, ambient lighting
-- **Turn Signals**: Left/right indicators, hazard lights with proper timing
-- **Fault Management**: Error detection, logging, and recovery mechanisms
-- **CAN Interface**: Standard CAN 2.0B communication protocol
+- **Door Control**: Lock/unlock with state machine transitions
+- **Lighting Control**: Headlights (off/on/auto), interior lights, high beam
+- **Turn Signals**: Left/right/hazard with proper flash timing, auto-off timeout
+- **Fault Management**: Checksum/counter validation, fault logging, status reporting
+- **CAN Interface**: 11-bit standard IDs, rolling counter, XOR checksum
+- **Event Log**: Ring buffer for state transition history
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Door Control    Lighting    Turn Signal   Fault   │
+│  State Machine   State M/C   State M/C     Manager │
+├─────────────────────────────────────────────────────┤
+│                    BCM Core                         │
+│         Message routing, periodic scheduler         │
+├─────────────────────────────────────────────────────┤
+│              CAN Interface Layer                    │
+│     BCM_SIL=1: SocketCAN | BCM_SIL=0: Stub         │
+└─────────────────────────────────────────────────────┘
+```
 
 ## Project Structure
 
 ```
 automotive-bcm/
-├── README.md                 # This file
-├── CMakeLists.txt            # Top-level CMake configuration
-├── .gitignore                # Git ignore rules
-├── config/                   # Configuration headers
-│   ├── can_ids.h             # CAN message ID definitions
-│   └── bcm_config.h          # BCM configuration parameters
-├── include/                  # Public header files
-│   ├── bcm.h                 # Main BCM interface
-│   ├── door_control.h        # Door control module
-│   ├── lighting_control.h    # Lighting control module
-│   ├── turn_signal.h         # Turn signal module
-│   ├── fault_manager.h       # Fault management module
-│   ├── can_interface.h       # CAN abstraction layer
-│   └── system_state.h        # System state definitions
-├── src/                      # Source files
-│   ├── main.c                # Application entry point
-│   ├── bcm.c                 # BCM core implementation
-│   ├── door_control.c        # Door control implementation
-│   ├── lighting_control.c    # Lighting control implementation
-│   ├── turn_signal.c         # Turn signal implementation
-│   ├── fault_manager.c       # Fault manager implementation
-│   ├── can_rx.c              # CAN receive handler
-│   └── can_tx.c              # CAN transmit handler
-├── tests/                    # Unit tests (CppUTest)
-│   ├── CMakeLists.txt        # Test build configuration
-│   ├── test_door_control.cpp # Door control tests
-│   ├── test_lighting_control.cpp # Lighting control tests
-│   └── test_fault_manager.cpp    # Fault manager tests
-├── tools/                    # Development tools
-│   └── can_simulator.py      # CAN bus simulator for testing
-└── docs/                     # Documentation
-    ├── architecture.md       # System architecture
-    ├── state_machines.md     # State machine documentation
-    └── testing_strategy.md   # Testing approach
+├── config/
+│   ├── can_ids.h           # CAN message schema with byte layouts
+│   └── bcm_config.h        # BCM configuration parameters
+├── include/
+│   ├── bcm.h               # BCM core interface
+│   ├── door_control.h      # Door control module
+│   ├── lighting_control.h  # Lighting control module
+│   ├── turn_signal.h       # Turn signal module
+│   ├── fault_manager.h     # Fault management
+│   ├── can_interface.h     # CAN abstraction layer
+│   └── system_state.h      # Centralized state
+├── src/
+│   ├── main.c              # Application entry point
+│   ├── bcm.c               # BCM core implementation
+│   ├── door_control.c      # Door state machine
+│   ├── lighting_control.c  # Lighting state machine
+│   ├── turn_signal.c       # Turn signal state machine
+│   ├── fault_manager.c     # Fault recording/reporting
+│   ├── system_state.c      # State management
+│   └── can_interface.c     # SocketCAN/stub implementation
+├── tests/                  # CppUTest unit tests
+├── tools/
+│   └── can_simulator.py    # Python CAN test tool
+└── docs/                   # Architecture documentation
 ```
-
-## Prerequisites
-
-### Build Tools
-- CMake 3.16 or higher
-- C11-compatible compiler (GCC, Clang)
-- C++11-compatible compiler (for tests)
-
-### Testing Framework
-- CppUTest (installed locally or fetched automatically)
 
 ## Build Instructions
 
-### macOS
+### Prerequisites
+
+- CMake 3.16+
+- C11-compatible compiler (GCC, Clang)
+- CppUTest (for testing, optional - auto-fetched if not found)
+
+### macOS / Linux (Stub Mode)
 
 ```bash
-# Install prerequisites (using Homebrew)
-brew install cmake
-
-# Optional: Install CppUTest for testing
-brew install cpputest
-
 # Clone and build
-git clone <repository-url>
 cd automotive-bcm
-
-# Create build directory
 mkdir build && cd build
-
-# Configure (Release build)
 cmake -DCMAKE_BUILD_TYPE=Release ..
-
-# Build application
 cmake --build .
 
-# Run the application
+# Run
 ./bcm_app
 ```
 
-### Linux (Ubuntu/Debian)
+### Linux with SocketCAN (SIL Mode)
 
 ```bash
-# Install prerequisites
-sudo apt-get update
-sudo apt-get install -y cmake build-essential
+# Create virtual CAN interface
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
 
-# Optional: Install CppUTest for testing
-sudo apt-get install -y cpputest
-
-# Clone and build
-git clone <repository-url>
-cd automotive-bcm
-
-# Create build directory
+# Build with SocketCAN support
 mkdir build && cd build
-
-# Configure (Release build)
-cmake -DCMAKE_BUILD_TYPE=Release ..
-
-# Build application
+cmake -DCMAKE_BUILD_TYPE=Release -DBCM_SIL=ON ..
 cmake --build .
 
-# Run the application
-./bcm_app
+# Run
+./bcm_app -i vcan0
 ```
 
 ### Building Tests
 
 ```bash
-# From the build directory
+mkdir build && cd build
 cmake -DBUILD_TESTS=ON ..
 cmake --build .
 
 # Run tests
 ctest --output-on-failure
 
-# Or run directly
+# Or run directly with verbose output
+./bcm_tests -v
+```
+
+## Running
+
+### Stub Mode (Default)
+
+```bash
+./bcm_app
+
+# Output:
+# ========================================
+#   BCM - Body Control Module
+#   Version: 1.0.0
+# ========================================
+# 
+# [CAN] Initialized (stub mode)
+# [DOOR] Initialized
+# [LIGHT] Initialized
+# [TURN] Initialized
+# [FAULT] Initialized
+# [BCM] Initialized successfully
+# 
+# [MAIN] BCM running. Press Ctrl+C to exit.
+# [     1.000s] Doors:UUUU | Head:OFF | Turn:OFF[--] | Faults:0
+```
+
+### SIL Mode with Simulator
+
+Terminal 1 (BCM):
+```bash
+./bcm_app -i vcan0
+```
+
+Terminal 2 (Simulator):
+```bash
+python3 tools/can_simulator.py -i vcan0 --interactive
+
+# Commands:
+> door unlock       # Unlock all doors
+> light on          # Headlights on
+> turn left         # Left turn signal
+> hazard on         # Hazard lights
+> scenario 1        # Run predefined scenario
+```
+
+## CAN Message Format
+
+### Command Frames (RX)
+
+All commands use 4-byte format:
+- Byte 0: Command code
+- Byte 1: Parameter
+- Byte 2: [7:4] Version, [3:0] Counter (0-15)
+- Byte 3: Checksum (XOR with 0xAA seed)
+
+| ID | Name | Commands |
+|----|------|----------|
+| 0x100 | DOOR_CMD | 0x01=Lock all, 0x02=Unlock all, 0x03/0x04=Single |
+| 0x110 | LIGHTING_CMD | 0x00=Off, 0x01=On, 0x02=Auto, 0x03/0x04=High beam |
+| 0x120 | TURN_SIGNAL_CMD | 0x00=Off, 0x01=Left, 0x02=Right, 0x03/0x04=Hazard |
+
+### Status Frames (TX)
+
+| ID | Name | Period | DLC |
+|----|------|--------|-----|
+| 0x200 | DOOR_STATUS | 100ms | 6 |
+| 0x210 | LIGHTING_STATUS | 100ms | 6 |
+| 0x220 | TURN_SIGNAL_STATUS | 100ms | 6 |
+| 0x230 | FAULT_STATUS | 500ms | 8 |
+| 0x240 | BCM_HEARTBEAT | 1000ms | 4 |
+
+## Sample Output
+
+### Normal Operation
+
+```
+[DOOR] Door 0: UNLOCKING
+[DOOR] Door 0: UNLOCKED
+[DOOR] Door 1: UNLOCKING
+[DOOR] Door 1: UNLOCKED
+[LIGHT] Headlight mode: 0 -> 1
+[TURN] LEFT ON
+[     5.000s] Doors:UUUU | Head:ON  | Turn:LEFT[L-] | Faults:0
+[     6.000s] Doors:UUUU | Head:ON  | Turn:LEFT[--] | Faults:0
+```
+
+### Fault Injection
+
+```
+[DOOR] Command error: 1
+[FAULT] SET: 0x23
+[     8.000s] Doors:UUUU | Head:OFF | Turn:OFF[--] | Faults:1
+```
+
+### Event Log (on exit)
+
+```
+[MAIN] Event Log (8 entries):
+  [    1000 ms] Type=1 Data=[00 00 00 00]
+  [    1500 ms] Type=3 Data=[00 00 01 00]
+  [    2000 ms] Type=5 Data=[00 01 00 00]
+  [    3000 ms] Type=9 Data=[01 FF 00 00]
+```
+
+## Testing
+
+### Unit Tests
+
+```bash
+# Run all tests
 ./bcm_tests
+
+# Verbose output
+./bcm_tests -v
+
+# Specific test group
+./bcm_tests -g DoorLockCommands
+
+# Specific test
+./bcm_tests -n "DoorCommandValidation::RejectsInvalidChecksum"
 ```
 
-### Debug Build
+### Test Coverage
+
+- Door control: Lock/unlock, state transitions, validation
+- Lighting: Mode changes, auto logic, high beam
+- Turn signals: Flash timing, hazard, timeout
+- Fault manager: Set/clear, flags, status frame
+- Edge cases: Counter wrap, max faults, invalid inputs
+
+### SIL Scenarios
 
 ```bash
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-cmake --build .
+# Run predefined scenarios
+python3 tools/can_simulator.py -s 1    # Basic operation
+python3 tools/can_simulator.py -s 2    # Hazard lights
+python3 tools/can_simulator.py -s 3    # Fault injection
+python3 tools/can_simulator.py -s all  # All scenarios
 ```
 
-## CAN Simulator
+## Documentation
 
-A Python-based CAN simulator is provided for testing:
+- [docs/architecture.md](docs/architecture.md) - System design, CAN schema
+- [docs/state_machines.md](docs/state_machines.md) - State diagrams, transitions
+- [docs/testing_strategy.md](docs/testing_strategy.md) - Test approach, coverage
 
-```bash
-# Install Python dependencies
-pip install python-can
+## Design Constraints
 
-# Run simulator (requires virtual CAN interface or hardware)
-python tools/can_simulator.py
-```
-
-## Configuration
-
-### CAN IDs
-Edit `config/can_ids.h` to customize CAN message identifiers for your vehicle network.
-
-### BCM Parameters
-Edit `config/bcm_config.h` to adjust timing, thresholds, and feature enables.
+- **No dynamic allocation** - All memory statically allocated
+- **Defensive coding** - All inputs validated
+- **C11 standard** - No compiler extensions
+- **Embedded-friendly** - ~1.6KB RAM footprint
 
 ## License
 
 Copyright (c) 2026. All rights reserved.
-
-## Contributing
-
-1. Follow the coding standards in `docs/architecture.md`
-2. Ensure all tests pass before submitting changes
-3. Add tests for new functionality
-4. Update documentation as needed

@@ -1,582 +1,360 @@
 /**
  * @file test_fault_manager.cpp
- * @brief Unit tests for Fault Management Module
+ * @brief Unit tests for Fault Manager Module
  *
- * Tests for fault detection, logging, recovery, and diagnostics.
+ * Tests:
+ * - Fault set/clear behavior
+ * - Fault flags correctness
+ * - Status frame payload
+ * - Multiple faults handling
  */
 
 #include "CppUTest/TestHarness.h"
-#include "CppUTestExt/MockSupport.h"
 
 extern "C" {
 #include "fault_manager.h"
-#include "system_state.h"
-#include "bcm_config.h"
+#include "can_interface.h"
+#include "can_ids.h"
 }
 
-/* Test fault codes */
-static const fault_code_t TEST_FAULT_1 = 0x1001;
-static const fault_code_t TEST_FAULT_2 = 0x1002;
-static const fault_code_t TEST_FAULT_CRITICAL = 0x5001;
-
-/* =============================================================================
+/*******************************************************************************
  * Test Group: Fault Manager Initialization
- * ========================================================================== */
+ ******************************************************************************/
 
-TEST_GROUP(FaultManagerInit)
+TEST_GROUP(FaultInit)
 {
     void setup() override
     {
-        system_state_init();
-    }
-
-    void teardown() override
-    {
-        fault_manager_deinit();
-        mock().clear();
-    }
-};
-
-TEST(FaultManagerInit, InitializesSuccessfully)
-{
-    bcm_result_t result = fault_manager_init();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(FaultManagerInit, CanBeDeinitialized)
-{
-    fault_manager_init();
-    fault_manager_deinit();
-    /* Should not crash */
-}
-
-TEST(FaultManagerInit, NoFaultsAfterInit)
-{
-    fault_manager_init();
-    CHECK_EQUAL(0, fault_get_active_count());
-    CHECK_EQUAL(0, fault_get_stored_count());
-}
-
-/* =============================================================================
- * Test Group: Fault Reporting
- * ========================================================================== */
-
-TEST_GROUP(FaultReporting)
-{
-    void setup() override
-    {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
         fault_manager_init();
     }
 
     void teardown() override
     {
-        fault_manager_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(FaultReporting, ReportFaultSucceeds)
+TEST(FaultInit, NoFaultsInitially)
 {
-    bcm_result_t result = fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_EQUAL(BCM_OK, result);
+    CHECK_EQUAL(0, fault_manager_get_count());
 }
 
-TEST(FaultReporting, ReportedFaultIsPending)
+TEST(FaultInit, FlagsZeroInitially)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_EQUAL(FAULT_STATUS_PENDING, fault_get_status(TEST_FAULT_1));
+    CHECK_EQUAL(0, fault_manager_get_flags1());
+    CHECK_EQUAL(0, fault_manager_get_flags2());
 }
 
-TEST(FaultReporting, ReportedFaultIsPresent)
+TEST(FaultInit, MostRecentNoneInitially)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_TRUE(fault_is_present(TEST_FAULT_1));
+    CHECK_EQUAL(FAULT_CODE_NONE, fault_manager_get_most_recent());
 }
 
-TEST(FaultReporting, MultipleFaultsCanBeReported)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_ERROR);
-    
-    CHECK_TRUE(fault_is_present(TEST_FAULT_1));
-    CHECK_TRUE(fault_is_present(TEST_FAULT_2));
-}
+/*******************************************************************************
+ * Test Group: Fault Set/Clear
+ ******************************************************************************/
 
-TEST(FaultReporting, ReportWithFreezeFrameSucceeds)
-{
-    uint8_t freeze_frame[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    bcm_result_t result = fault_report_with_data(TEST_FAULT_1, 
-                                                  FAULT_SEVERITY_WARNING,
-                                                  freeze_frame);
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(FaultReporting, StoredCountIncrements)
-{
-    CHECK_EQUAL(0, fault_get_stored_count());
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_EQUAL(1, fault_get_stored_count());
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_WARNING);
-    CHECK_EQUAL(2, fault_get_stored_count());
-}
-
-TEST(FaultReporting, SameFaultReportedTwiceOnlyStoredOnce)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_EQUAL(1, fault_get_stored_count());
-}
-
-/* =============================================================================
- * Test Group: Fault Clearing
- * ========================================================================== */
-
-TEST_GROUP(FaultClearing)
+TEST_GROUP(FaultSetClear)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
         fault_manager_init();
     }
 
     void teardown() override
     {
-        fault_manager_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(FaultClearing, ClearFaultSucceeds)
+TEST(FaultSetClear, SetFaultIncrementsCount)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    bcm_result_t result = fault_clear(TEST_FAULT_1);
-    CHECK_EQUAL(BCM_OK, result);
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    CHECK_EQUAL(1, fault_manager_get_count());
 }
 
-TEST(FaultClearing, ClearedFaultIsInactive)
+TEST(FaultSetClear, SetFaultIsActive)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_clear(TEST_FAULT_1);
-    CHECK_EQUAL(FAULT_STATUS_INACTIVE, fault_get_status(TEST_FAULT_1));
+    fault_manager_set(FAULT_CODE_HEADLIGHT_BULB);
+    CHECK_TRUE(fault_manager_is_active(FAULT_CODE_HEADLIGHT_BULB));
 }
 
-TEST(FaultClearing, ClearedFaultIsNotPresent)
+TEST(FaultSetClear, ClearFaultDecrementsCount)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_clear(TEST_FAULT_1);
-    CHECK_FALSE(fault_is_present(TEST_FAULT_1));
-}
-
-TEST(FaultClearing, ClearAllFaultsSucceeds)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_ERROR);
-    bcm_result_t result = fault_clear_all();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(FaultClearing, ClearAllMakesAllInactive)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_ERROR);
-    fault_clear_all();
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    fault_manager_set(FAULT_CODE_TURN_BULB);
+    CHECK_EQUAL(2, fault_manager_get_count());
     
-    CHECK_FALSE(fault_is_present(TEST_FAULT_1));
-    CHECK_FALSE(fault_is_present(TEST_FAULT_2));
+    fault_manager_clear(FAULT_CODE_DOOR_MOTOR);
+    CHECK_EQUAL(1, fault_manager_get_count());
 }
 
-TEST(FaultClearing, ClearNonExistentFaultReturnsError)
+TEST(FaultSetClear, ClearFaultIsNotActive)
 {
-    bcm_result_t result = fault_clear(0xFFFF);
-    CHECK_EQUAL(BCM_ERROR, result);
+    fault_manager_set(FAULT_CODE_CAN_COMM);
+    fault_manager_clear(FAULT_CODE_CAN_COMM);
+    CHECK_FALSE(fault_manager_is_active(FAULT_CODE_CAN_COMM));
 }
 
-/* =============================================================================
- * Test Group: Fault Healing
- * ========================================================================== */
+TEST(FaultSetClear, ClearAllFaults)
+{
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    fault_manager_set(FAULT_CODE_HEADLIGHT_BULB);
+    fault_manager_set(FAULT_CODE_TURN_BULB);
+    CHECK_EQUAL(3, fault_manager_get_count());
+    
+    fault_manager_clear_all();
+    CHECK_EQUAL(0, fault_manager_get_count());
+}
 
-TEST_GROUP(FaultHealing)
+TEST(FaultSetClear, SetSameFaultTwiceNoDouble)
+{
+    fault_manager_set(FAULT_CODE_TIMEOUT);
+    fault_manager_set(FAULT_CODE_TIMEOUT);
+    CHECK_EQUAL(1, fault_manager_get_count());
+}
+
+TEST(FaultSetClear, ClearNonexistentFaultNoError)
+{
+    fault_manager_clear(FAULT_CODE_TIMEOUT);
+    CHECK_EQUAL(0, fault_manager_get_count());
+}
+
+TEST(FaultSetClear, MostRecentUpdated)
+{
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    CHECK_EQUAL(FAULT_CODE_DOOR_MOTOR, fault_manager_get_most_recent());
+    
+    fault_manager_set(FAULT_CODE_TURN_BULB);
+    CHECK_EQUAL(FAULT_CODE_TURN_BULB, fault_manager_get_most_recent());
+}
+
+/*******************************************************************************
+ * Test Group: Fault Flags
+ ******************************************************************************/
+
+TEST_GROUP(FaultFlags)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
         fault_manager_init();
     }
 
     void teardown() override
     {
-        fault_manager_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(FaultHealing, HealFaultSucceeds)
+TEST(FaultFlags, DoorMotorFaultSetsFlag)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    bcm_result_t result = fault_heal(TEST_FAULT_1);
-    CHECK_EQUAL(BCM_OK, result);
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    CHECK_EQUAL(FAULT_BIT_DOOR_MOTOR, fault_manager_get_flags1() & FAULT_BIT_DOOR_MOTOR);
 }
 
-TEST(FaultHealing, HealedFaultHasHealedStatus)
+TEST(FaultFlags, HeadlightBulbFaultSetsFlag)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_heal(TEST_FAULT_1);
-    CHECK_EQUAL(FAULT_STATUS_HEALED, fault_get_status(TEST_FAULT_1));
+    fault_manager_set(FAULT_CODE_HEADLIGHT_BULB);
+    CHECK_EQUAL(FAULT_BIT_HEADLIGHT_BULB, fault_manager_get_flags1() & FAULT_BIT_HEADLIGHT_BULB);
 }
 
-TEST(FaultHealing, HealNonExistentFaultReturnsError)
+TEST(FaultFlags, TurnBulbFaultSetsFlag)
 {
-    bcm_result_t result = fault_heal(0xFFFF);
-    CHECK_EQUAL(BCM_ERROR, result);
+    fault_manager_set(FAULT_CODE_TURN_BULB);
+    CHECK_EQUAL(FAULT_BIT_TURN_BULB, fault_manager_get_flags1() & FAULT_BIT_TURN_BULB);
 }
 
-/* =============================================================================
- * Test Group: Fault Status Queries
- * ========================================================================== */
+TEST(FaultFlags, ChecksumFaultSetsFlag)
+{
+    fault_manager_set(FAULT_CODE_INVALID_CHECKSUM);
+    CHECK_EQUAL(FAULT_BIT_CMD_CHECKSUM, fault_manager_get_flags1() & FAULT_BIT_CMD_CHECKSUM);
+}
 
-TEST_GROUP(FaultStatusQueries)
+TEST(FaultFlags, CounterFaultSetsFlag)
+{
+    fault_manager_set(FAULT_CODE_INVALID_COUNTER);
+    CHECK_EQUAL(FAULT_BIT_CMD_COUNTER, fault_manager_get_flags1() & FAULT_BIT_CMD_COUNTER);
+}
+
+TEST(FaultFlags, TimeoutFaultSetsFlag)
+{
+    fault_manager_set(FAULT_CODE_TIMEOUT);
+    CHECK_EQUAL(FAULT_BIT_TIMEOUT, fault_manager_get_flags1() & FAULT_BIT_TIMEOUT);
+}
+
+TEST(FaultFlags, ClearFaultClearsFlag)
+{
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    CHECK_EQUAL(FAULT_BIT_DOOR_MOTOR, fault_manager_get_flags1() & FAULT_BIT_DOOR_MOTOR);
+    
+    fault_manager_clear(FAULT_CODE_DOOR_MOTOR);
+    CHECK_EQUAL(0, fault_manager_get_flags1() & FAULT_BIT_DOOR_MOTOR);
+}
+
+TEST(FaultFlags, MultipleFlagsSet)
+{
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    fault_manager_set(FAULT_CODE_HEADLIGHT_BULB);
+    fault_manager_set(FAULT_CODE_TIMEOUT);
+    
+    uint8_t expected = FAULT_BIT_DOOR_MOTOR | FAULT_BIT_HEADLIGHT_BULB | FAULT_BIT_TIMEOUT;
+    CHECK_EQUAL(expected, fault_manager_get_flags1());
+}
+
+/*******************************************************************************
+ * Test Group: Fault Status Frame
+ ******************************************************************************/
+
+TEST_GROUP(FaultStatusFrame)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
         fault_manager_init();
     }
 
     void teardown() override
     {
-        fault_manager_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(FaultStatusQueries, IsActiveReturnsFalseForInactive)
+TEST(FaultStatusFrame, HasCorrectId)
 {
-    CHECK_FALSE(fault_is_active(TEST_FAULT_1));
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
+    CHECK_EQUAL(CAN_ID_FAULT_STATUS, frame.id);
 }
 
-TEST(FaultStatusQueries, IsPresentReturnsFalseForUnreported)
+TEST(FaultStatusFrame, HasCorrectDlc)
 {
-    CHECK_FALSE(fault_is_present(TEST_FAULT_1));
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
+    CHECK_EQUAL(FAULT_STATUS_DLC, frame.dlc);
 }
 
-TEST(FaultStatusQueries, GetStatusReturnsInactiveForUnreported)
+TEST(FaultStatusFrame, Flags1Correct)
 {
-    CHECK_EQUAL(FAULT_STATUS_INACTIVE, fault_get_status(0xFFFF));
-}
-
-TEST(FaultStatusQueries, GetEntrySucceeds)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    fault_manager_set(FAULT_CODE_TURN_BULB);
     
-    fault_entry_t entry;
-    bcm_result_t result = fault_get_entry(TEST_FAULT_1, &entry);
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
     
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(TEST_FAULT_1, entry.code);
-    CHECK_EQUAL(FAULT_SEVERITY_WARNING, entry.severity);
+    uint8_t expected = FAULT_BIT_DOOR_MOTOR | FAULT_BIT_TURN_BULB;
+    CHECK_EQUAL(expected, frame.data[FAULT_STATUS_BYTE_FLAGS1]);
 }
 
-TEST(FaultStatusQueries, GetEntryWithNullPointerFails)
+TEST(FaultStatusFrame, CountCorrect)
 {
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    bcm_result_t result = fault_get_entry(TEST_FAULT_1, nullptr);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    fault_manager_set(FAULT_CODE_TURN_BULB);
+    fault_manager_set(FAULT_CODE_CAN_COMM);
+    
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
+    
+    /* Total count includes historical */
+    CHECK_TRUE(frame.data[FAULT_STATUS_BYTE_COUNT] >= 3);
 }
 
-TEST(FaultStatusQueries, GetEntryForNonExistentFails)
+TEST(FaultStatusFrame, MostRecentCodeCorrect)
 {
-    fault_entry_t entry;
-    bcm_result_t result = fault_get_entry(0xFFFF, &entry);
-    CHECK_EQUAL(BCM_ERROR, result);
+    fault_manager_set(FAULT_CODE_TIMEOUT);
+    
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
+    
+    CHECK_EQUAL(FAULT_CODE_TIMEOUT, frame.data[FAULT_STATUS_BYTE_RECENT_CODE]);
 }
 
-TEST(FaultStatusQueries, GetActiveCountReturnsCorrectValue)
+TEST(FaultStatusFrame, ChecksumValid)
 {
-    CHECK_EQUAL(0, fault_get_active_count());
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_TRUE(fault_get_active_count() >= 1);  /* Pending counts */
+    fault_manager_set(FAULT_CODE_DOOR_MOTOR);
+    
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
+    
+    uint8_t calc = can_calculate_checksum(frame.data, FAULT_STATUS_DLC - 1);
+    CHECK_EQUAL(calc, frame.data[FAULT_STATUS_BYTE_CHECKSUM]);
 }
 
-/* =============================================================================
- * Test Group: Critical Faults
- * ========================================================================== */
+TEST(FaultStatusFrame, VersionCorrect)
+{
+    can_frame_t frame;
+    fault_manager_build_status_frame(&frame);
+    
+    uint8_t version = CAN_GET_VERSION(frame.data[FAULT_STATUS_BYTE_VER_CTR]);
+    CHECK_EQUAL(CAN_SCHEMA_VERSION, version);
+}
 
-TEST_GROUP(CriticalFaults)
+TEST(FaultStatusFrame, CounterIncrements)
+{
+    can_frame_t frame1, frame2;
+    
+    fault_manager_build_status_frame(&frame1);
+    uint8_t counter1 = CAN_GET_COUNTER(frame1.data[FAULT_STATUS_BYTE_VER_CTR]);
+    
+    fault_manager_build_status_frame(&frame2);
+    uint8_t counter2 = CAN_GET_COUNTER(frame2.data[FAULT_STATUS_BYTE_VER_CTR]);
+    
+    CHECK_EQUAL((counter1 + 1) & CAN_COUNTER_MASK, counter2);
+}
+
+/*******************************************************************************
+ * Test Group: Fault Manager Edge Cases
+ ******************************************************************************/
+
+TEST_GROUP(FaultEdgeCases)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
         fault_manager_init();
     }
 
     void teardown() override
     {
-        fault_manager_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(CriticalFaults, AnyCriticalReturnsFalseWhenNone)
+TEST(FaultEdgeCases, MaxFaultsHandled)
 {
-    CHECK_FALSE(fault_any_critical());
-}
-
-TEST(CriticalFaults, AnyCriticalReturnsTrueWhenCriticalPresent)
-{
-    fault_report(TEST_FAULT_CRITICAL, FAULT_SEVERITY_CRITICAL);
-    CHECK_TRUE(fault_any_critical());
-}
-
-TEST(CriticalFaults, AnyCriticalReturnsFalseForWarnings)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    CHECK_FALSE(fault_any_critical());
-}
-
-TEST(CriticalFaults, AnyCriticalReturnsFalseForErrors)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_ERROR);
-    CHECK_FALSE(fault_any_critical());
-}
-
-/* =============================================================================
- * Test Group: Fault Log Access
- * ========================================================================== */
-
-TEST_GROUP(FaultLogAccess)
-{
-    void setup() override
-    {
-        system_state_init();
-        fault_manager_init();
+    /* Set maximum faults */
+    for (int i = 0; i < MAX_ACTIVE_FAULTS; i++) {
+        fault_manager_set((fault_code_t)(0x10 + i));
     }
+    
+    CHECK_EQUAL(MAX_ACTIVE_FAULTS, fault_manager_get_count());
+    
+    /* Try to add one more - should be silently ignored */
+    fault_manager_set(FAULT_CODE_TIMEOUT);
+    CHECK_EQUAL(MAX_ACTIVE_FAULTS, fault_manager_get_count());
+}
 
-    void teardown() override
-    {
-        fault_manager_deinit();
-        mock().clear();
+TEST(FaultEdgeCases, ClearAllAfterMax)
+{
+    for (int i = 0; i < MAX_ACTIVE_FAULTS; i++) {
+        fault_manager_set((fault_code_t)(0x10 + i));
     }
-};
-
-TEST(FaultLogAccess, GetByIndexSucceeds)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
     
-    fault_entry_t entry;
-    bcm_result_t result = fault_get_by_index(0, &entry);
-    
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(TEST_FAULT_1, entry.code);
+    fault_manager_clear_all();
+    CHECK_EQUAL(0, fault_manager_get_count());
+    CHECK_EQUAL(0, fault_manager_get_flags1());
 }
 
-TEST(FaultLogAccess, GetByIndexInvalidIndexFails)
+TEST(FaultEdgeCases, UnknownFaultCodeNoFlag)
 {
-    fault_entry_t entry;
-    bcm_result_t result = fault_get_by_index(999, &entry);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(FaultLogAccess, GetByIndexWithNullPointerFails)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    bcm_result_t result = fault_get_by_index(0, nullptr);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(FaultLogAccess, GetActiveCodesReturnsCorrectCodes)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_ERROR);
-    
-    fault_code_t codes[10];
-    uint16_t count = fault_get_active_codes(codes, 10);
-    
-    CHECK_TRUE(count >= 2);
-}
-
-TEST(FaultLogAccess, GetActiveCodesWithNullReturnsZero)
-{
-    uint16_t count = fault_get_active_codes(nullptr, 10);
-    CHECK_EQUAL(0, count);
-}
-
-TEST(FaultLogAccess, GetSnapshotReturnsData)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    
-    uint8_t buffer[64];
-    uint16_t len = fault_get_snapshot(buffer, sizeof(buffer));
-    
-    CHECK_TRUE(len > 0);
-}
-
-TEST(FaultLogAccess, GetSnapshotWithNullReturnsZero)
-{
-    uint16_t len = fault_get_snapshot(nullptr, 64);
-    CHECK_EQUAL(0, len);
-}
-
-/* =============================================================================
- * Test Group: Fault Recovery
- * ========================================================================== */
-
-static bcm_result_t test_recovery_action(fault_code_t code)
-{
-    (void)code;
-    return BCM_OK;
-}
-
-static bcm_result_t test_recovery_fail(fault_code_t code)
-{
-    (void)code;
-    return BCM_ERROR;
-}
-
-TEST_GROUP(FaultRecovery)
-{
-    void setup() override
-    {
-        system_state_init();
-        fault_manager_init();
-    }
-
-    void teardown() override
-    {
-        fault_manager_deinit();
-        mock().clear();
-    }
-};
-
-TEST(FaultRecovery, RegisterRecoverySucceeds)
-{
-    bcm_result_t result = fault_register_recovery(TEST_FAULT_1, test_recovery_action);
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(FaultRecovery, RegisterNullActionFails)
-{
-    bcm_result_t result = fault_register_recovery(TEST_FAULT_1, nullptr);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(FaultRecovery, AttemptRecoveryWithoutRegistrationFails)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    bcm_result_t result = fault_attempt_recovery(TEST_FAULT_1);
-    CHECK_EQUAL(BCM_ERROR_NOT_SUPPORTED, result);
-}
-
-TEST(FaultRecovery, AttemptRecoveryCallsAction)
-{
-    fault_register_recovery(TEST_FAULT_1, test_recovery_action);
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    
-    bcm_result_t result = fault_attempt_recovery(TEST_FAULT_1);
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(FaultRecovery, FailedRecoveryReturnsError)
-{
-    fault_register_recovery(TEST_FAULT_2, test_recovery_fail);
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_WARNING);
-    
-    bcm_result_t result = fault_attempt_recovery(TEST_FAULT_2);
-    CHECK_EQUAL(BCM_ERROR, result);
-}
-
-/* =============================================================================
- * Test Group: Diagnostic Interface
- * ========================================================================== */
-
-TEST_GROUP(DiagnosticInterface)
-{
-    void setup() override
-    {
-        system_state_init();
-        fault_manager_init();
-    }
-
-    void teardown() override
-    {
-        fault_manager_deinit();
-        mock().clear();
-    }
-};
-
-TEST(DiagnosticInterface, ReadDtcByStatusReturnsData)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    
-    uint8_t buffer[64];
-    uint16_t len = fault_read_dtc_by_status(0xFF, buffer, sizeof(buffer));
-    
-    CHECK_TRUE(len > 0);
-}
-
-TEST(DiagnosticInterface, ClearDtcSucceeds)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    bcm_result_t result = fault_clear_dtc(0xFFFFFF);
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(DiagnosticInterface, ClearDtcClearsAllFaults)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    fault_report(TEST_FAULT_2, FAULT_SEVERITY_ERROR);
-    
-    fault_clear_dtc(0xFFFFFF);
-    
-    CHECK_FALSE(fault_is_present(TEST_FAULT_1));
-    CHECK_FALSE(fault_is_present(TEST_FAULT_2));
-}
-
-/* =============================================================================
- * Test Group: CAN Message Handling
- * ========================================================================== */
-
-TEST_GROUP(FaultCanMessages)
-{
-    void setup() override
-    {
-        system_state_init();
-        fault_manager_init();
-    }
-
-    void teardown() override
-    {
-        fault_manager_deinit();
-        mock().clear();
-    }
-};
-
-TEST(FaultCanMessages, GetCanStatusFillsBuffer)
-{
-    uint8_t data[8] = {0};
-    uint8_t len = 0;
-    fault_manager_get_can_status(data, &len);
-    CHECK_EQUAL(8, len);
-}
-
-TEST(FaultCanMessages, CanStatusContainsActiveCount)
-{
-    fault_report(TEST_FAULT_1, FAULT_SEVERITY_WARNING);
-    
-    uint8_t data[8] = {0};
-    uint8_t len = 0;
-    fault_manager_get_can_status(data, &len);
-    
-    /* Active count in bytes 0-1 */
-    uint16_t active = (uint16_t)((uint16_t)data[0] << 8) | data[1];
-    CHECK_TRUE(active >= 1);
-}
-
-/* =============================================================================
- * CppUTest Main
- * ========================================================================== */
-
-int main(int argc, char** argv)
-{
-    return CommandLineTestRunner::RunAllTests(argc, argv);
+    fault_manager_set((fault_code_t)0x99);
+    CHECK_TRUE(fault_manager_is_active((fault_code_t)0x99));
+    CHECK_EQUAL(0, fault_manager_get_flags1()); /* No flag mapped */
 }

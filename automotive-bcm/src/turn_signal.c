@@ -2,535 +2,349 @@
  * @file turn_signal.c
  * @brief Turn Signal Control Module Implementation
  *
- * Implements turn signal and hazard light control with proper
- * timing, lane change assist, and bulb monitoring.
+ * State machine: OFF <-> LEFT / RIGHT / HAZARD
+ * Flash timing managed in 10ms update task.
  */
 
 #include <string.h>
+#include <stdio.h>
 #include "turn_signal.h"
 #include "fault_manager.h"
-#include "bcm_config.h"
 #include "can_ids.h"
 
-/* =============================================================================
- * Private Definitions
- * ========================================================================== */
-
-/** Turn signal internal state */
-typedef struct {
-    bool initialized;
-    turn_mode_t mode;
-    turn_direction_t direction;
-    bool output_state;              /* Current output level (on/off) */
-    uint32_t last_toggle_time;      /* Time of last toggle */
-    uint8_t blink_count;            /* Number of blinks since activation */
-    uint8_t lane_change_blinks;     /* Configured lane change blink count */
-    uint16_t on_time_ms;            /* Flash on duration */
-    uint16_t off_time_ms;           /* Flash off duration */
-    bool fast_flash_enabled;        /* Fast flash for bulb failure */
-    bool left_bulb_ok;              /* Left bulb status */
-    bool right_bulb_ok;             /* Right bulb status */
-    uint16_t left_bulb_current;     /* Left bulb current (mA) */
-    uint16_t right_bulb_current;    /* Right bulb current (mA) */
-    int16_t steering_angle;         /* Current steering angle */
-    bool auto_cancel_enabled;       /* Auto-cancel after turn */
-    int16_t turn_start_angle;       /* Steering angle when turn started */
-} turn_signal_state_t;
-
-static turn_signal_state_t g_turn_state;
-
-/* =============================================================================
- * Private Helper Functions
- * ========================================================================== */
+/*******************************************************************************
+ * Private Functions
+ ******************************************************************************/
 
 /**
- * @brief Set physical turn signal outputs
+ * @brief Validate turn signal command frame
  */
-static void set_turn_outputs(bool left, bool right)
+static cmd_result_t validate_turn_cmd(const can_frame_t *frame)
 {
-    system_state_t *state = system_state_get_mutable();
-    state->turn_signal.output_state = left || right;
+    system_state_t *state = sys_state_get_mut();
     
-    /* In real implementation, drive GPIO here */
-    (void)left;
-    (void)right;
-}
-
-/**
- * @brief Update system state from internal state
- */
-static void update_system_state(void)
-{
-    system_state_t *state = system_state_get_mutable();
-    
-    if (g_turn_state.mode == TURN_MODE_HAZARD) {
-        state->turn_signal.state = TURN_SIGNAL_HAZARD;
-    } else if (g_turn_state.direction == TURN_DIRECTION_LEFT) {
-        state->turn_signal.state = TURN_SIGNAL_LEFT;
-    } else if (g_turn_state.direction == TURN_DIRECTION_RIGHT) {
-        state->turn_signal.state = TURN_SIGNAL_RIGHT;
-    } else {
-        state->turn_signal.state = TURN_SIGNAL_OFF;
+    /* Check DLC */
+    if (frame->dlc != TURN_SIGNAL_CMD_DLC) {
+        fault_manager_set(FAULT_CODE_INVALID_LENGTH);
+        return CMD_RESULT_INVALID_CMD;
     }
     
-    state->turn_signal.left_bulb_ok = g_turn_state.left_bulb_ok;
-    state->turn_signal.right_bulb_ok = g_turn_state.right_bulb_ok;
-    state->turn_signal.blink_count = g_turn_state.blink_count;
-    state->turn_signal.output_state = g_turn_state.output_state;
+    /* Extract fields */
+    uint8_t ver_ctr = frame->data[TURN_CMD_BYTE_VER_CTR];
+    uint8_t checksum = frame->data[TURN_CMD_BYTE_CHECKSUM];
+    
+    /* Validate checksum */
+    uint8_t calc_checksum = can_calculate_checksum(frame->data, TURN_SIGNAL_CMD_DLC - 1);
+    if (checksum != calc_checksum) {
+        fault_manager_set(FAULT_CODE_INVALID_CHECKSUM);
+        return CMD_RESULT_CHECKSUM_ERROR;
+    }
+    
+    /* Validate counter */
+    uint8_t counter = CAN_GET_COUNTER(ver_ctr);
+    if (state->turn_signal.last_cmd_time_ms > 0) {
+        if (!can_validate_counter(counter, state->turn_signal.last_counter)) {
+            fault_manager_set(FAULT_CODE_INVALID_COUNTER);
+            return CMD_RESULT_COUNTER_ERROR;
+        }
+    }
+    state->turn_signal.last_counter = counter;
+    
+    /* Validate command value */
+    uint8_t cmd = frame->data[TURN_CMD_BYTE_CMD];
+    if (cmd > TURN_CMD_MAX) {
+        fault_manager_set(FAULT_CODE_INVALID_CMD);
+        return CMD_RESULT_INVALID_CMD;
+    }
+    
+    return CMD_RESULT_OK;
 }
 
 /**
- * @brief Get current flash timing based on mode
+ * @brief Log turn signal state change event
  */
-static void get_flash_timing(uint16_t *on_ms, uint16_t *off_ms)
+static void log_turn_event(turn_signal_mode_t old_mode, turn_signal_mode_t new_mode)
 {
-    if (g_turn_state.fast_flash_enabled) {
-        *on_ms = TURN_FAST_FLASH_ON_MS;
-        *off_ms = TURN_FAST_FLASH_OFF_MS;
-    } else if (g_turn_state.mode == TURN_MODE_HAZARD) {
-        *on_ms = HAZARD_ON_TIME_MS;
-        *off_ms = HAZARD_OFF_TIME_MS;
+    uint8_t data[4] = { (uint8_t)old_mode, (uint8_t)new_mode, 0, 0 };
+    event_log_add(EVENT_TURN_SIGNAL_CHANGE, data);
+}
+
+/**
+ * @brief Get flash timing for current mode
+ */
+static void get_flash_timing(turn_signal_mode_t mode, uint16_t *on_ms, uint16_t *off_ms)
+{
+    if (mode == TURN_SIG_STATE_HAZARD) {
+        *on_ms = HAZARD_FLASH_ON_MS;
+        *off_ms = HAZARD_FLASH_OFF_MS;
     } else {
-        *on_ms = g_turn_state.on_time_ms;
-        *off_ms = g_turn_state.off_time_ms;
+        *on_ms = TURN_SIGNAL_FLASH_ON_MS;
+        *off_ms = TURN_SIGNAL_FLASH_OFF_MS;
     }
 }
 
-/* =============================================================================
- * Initialization
- * ========================================================================== */
+/*******************************************************************************
+ * Public Functions
+ ******************************************************************************/
 
-bcm_result_t turn_signal_init(void)
+void turn_signal_init(void)
 {
-    memset(&g_turn_state, 0, sizeof(g_turn_state));
+    system_state_t *state = sys_state_get_mut();
     
-    g_turn_state.mode = TURN_MODE_OFF;
-    g_turn_state.direction = TURN_DIRECTION_NONE;
-    g_turn_state.on_time_ms = TURN_SIGNAL_ON_TIME_MS;
-    g_turn_state.off_time_ms = TURN_SIGNAL_OFF_TIME_MS;
-    g_turn_state.lane_change_blinks = TURN_LANE_CHANGE_BLINKS;
-    g_turn_state.left_bulb_ok = true;
-    g_turn_state.right_bulb_ok = true;
-    g_turn_state.auto_cancel_enabled = true;
-    g_turn_state.initialized = true;
+    state->turn_signal.mode = TURN_SIG_STATE_OFF;
+    state->turn_signal.left_output = false;
+    state->turn_signal.right_output = false;
+    state->turn_signal.flash_count = 0;
+    state->turn_signal.last_toggle_ms = 0;
+    state->turn_signal.last_cmd_time_ms = 0;
+    state->turn_signal.last_counter = 0;
+    state->turn_signal.last_result = CMD_RESULT_OK;
     
-    update_system_state();
-    
-    return BCM_OK;
+    printf("[TURN] Initialized\n");
 }
 
-void turn_signal_deinit(void)
+cmd_result_t turn_signal_handle_cmd(const can_frame_t *frame)
 {
-    set_turn_outputs(false, false);
-    g_turn_state.initialized = false;
-}
-
-/* =============================================================================
- * Processing
- * ========================================================================== */
-
-bcm_result_t turn_signal_process(uint32_t timestamp_ms)
-{
-    if (!g_turn_state.initialized) {
-        return BCM_ERROR_NOT_READY;
+    if (frame == NULL || frame->id != CAN_ID_TURN_SIGNAL_CMD) {
+        return CMD_RESULT_INVALID_CMD;
     }
     
-    /* Nothing to do if off */
-    if (g_turn_state.mode == TURN_MODE_OFF) {
-        return BCM_OK;
-    }
+    system_state_t *state = sys_state_get_mut();
     
-    /* Get timing parameters */
-    uint16_t on_time, off_time;
-    get_flash_timing(&on_time, &off_time);
-    
-    /* Calculate time since last toggle */
-    uint32_t elapsed = timestamp_ms - g_turn_state.last_toggle_time;
-    uint16_t threshold = g_turn_state.output_state ? on_time : off_time;
-    
-    /* Check if it's time to toggle */
-    if (elapsed >= threshold) {
-        g_turn_state.output_state = !g_turn_state.output_state;
-        g_turn_state.last_toggle_time = timestamp_ms;
+    /* Validate frame */
+    cmd_result_t result = validate_turn_cmd(frame);
+    if (result != CMD_RESULT_OK) {
+        state->turn_signal.last_result = result;
         
-        /* Count blinks on rising edge */
-        if (g_turn_state.output_state) {
-            g_turn_state.blink_count++;
-        }
+        uint8_t data[4] = { (uint8_t)result, frame->data[0], 0, 0 };
+        event_log_add(EVENT_CMD_ERROR, data);
         
-        /* Update physical outputs */
-        bool left_on = false;
-        bool right_on = false;
-        
-        if (g_turn_state.output_state) {
-            if (g_turn_state.mode == TURN_MODE_HAZARD) {
-                left_on = true;
-                right_on = true;
-            } else if (g_turn_state.direction == TURN_DIRECTION_LEFT) {
-                left_on = true;
-            } else if (g_turn_state.direction == TURN_DIRECTION_RIGHT) {
-                right_on = true;
-            }
-        }
-        
-        set_turn_outputs(left_on, right_on);
+        printf("[TURN] Command error: %d\n", result);
+        return result;
     }
     
-    /* Check lane change completion */
-    if (g_turn_state.mode == TURN_MODE_LANE_CHANGE) {
-        if (g_turn_state.blink_count >= g_turn_state.lane_change_blinks) {
-            turn_signal_off();
-        }
-    }
-    
-    /* Check auto-cancel (simplified) */
-    if (g_turn_state.auto_cancel_enabled && 
-        g_turn_state.mode == TURN_MODE_NORMAL) {
-        /* In real implementation, check steering wheel return */
-    }
-    
-    /* Bulb monitoring */
-    if (g_turn_state.output_state) {
-        if (g_turn_state.direction == TURN_DIRECTION_LEFT || 
-            g_turn_state.mode == TURN_MODE_HAZARD) {
-            if (g_turn_state.left_bulb_current < TURN_BULB_CHECK_THRESHOLD_MA) {
-                if (g_turn_state.left_bulb_ok) {
-                    g_turn_state.left_bulb_ok = false;
-                    fault_report(FAULT_TURN_BULB_FL, FAULT_SEVERITY_WARNING);
-                    g_turn_state.fast_flash_enabled = true;
-                }
-            }
-        }
-        
-        if (g_turn_state.direction == TURN_DIRECTION_RIGHT || 
-            g_turn_state.mode == TURN_MODE_HAZARD) {
-            if (g_turn_state.right_bulb_current < TURN_BULB_CHECK_THRESHOLD_MA) {
-                if (g_turn_state.right_bulb_ok) {
-                    g_turn_state.right_bulb_ok = false;
-                    fault_report(FAULT_TURN_BULB_FR, FAULT_SEVERITY_WARNING);
-                    g_turn_state.fast_flash_enabled = true;
-                }
-            }
-        }
-    }
-    
-    update_system_state();
-    
-    return BCM_OK;
-}
-
-/* =============================================================================
- * Turn Signal Control
- * ========================================================================== */
-
-bcm_result_t turn_signal_left_on(void)
-{
-    g_turn_state.mode = TURN_MODE_NORMAL;
-    g_turn_state.direction = TURN_DIRECTION_LEFT;
-    g_turn_state.blink_count = 0;
-    g_turn_state.output_state = true;
-    g_turn_state.last_toggle_time = system_state_get()->uptime_ms;
-    g_turn_state.turn_start_angle = g_turn_state.steering_angle;
-    
-    set_turn_outputs(true, false);
-    update_system_state();
-    
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_left_off(void)
-{
-    if (g_turn_state.direction == TURN_DIRECTION_LEFT &&
-        g_turn_state.mode != TURN_MODE_HAZARD) {
-        return turn_signal_off();
-    }
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_right_on(void)
-{
-    g_turn_state.mode = TURN_MODE_NORMAL;
-    g_turn_state.direction = TURN_DIRECTION_RIGHT;
-    g_turn_state.blink_count = 0;
-    g_turn_state.output_state = true;
-    g_turn_state.last_toggle_time = system_state_get()->uptime_ms;
-    g_turn_state.turn_start_angle = g_turn_state.steering_angle;
-    
-    set_turn_outputs(false, true);
-    update_system_state();
-    
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_right_off(void)
-{
-    if (g_turn_state.direction == TURN_DIRECTION_RIGHT &&
-        g_turn_state.mode != TURN_MODE_HAZARD) {
-        return turn_signal_off();
-    }
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_off(void)
-{
-    g_turn_state.mode = TURN_MODE_OFF;
-    g_turn_state.direction = TURN_DIRECTION_NONE;
-    g_turn_state.output_state = false;
-    g_turn_state.blink_count = 0;
-    g_turn_state.fast_flash_enabled = false;
-    
-    set_turn_outputs(false, false);
-    update_system_state();
-    
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_set_direction(turn_direction_t direction)
-{
-    switch (direction) {
-        case TURN_DIRECTION_NONE:
-            return turn_signal_off();
-        case TURN_DIRECTION_LEFT:
-            return turn_signal_left_on();
-        case TURN_DIRECTION_RIGHT:
-            return turn_signal_right_on();
-        default:
-            return BCM_ERROR_INVALID_PARAM;
-    }
-}
-
-turn_direction_t turn_signal_get_direction(void)
-{
-    return g_turn_state.direction;
-}
-
-/* =============================================================================
- * Hazard Light Control
- * ========================================================================== */
-
-bcm_result_t turn_signal_hazard_on(void)
-{
-    g_turn_state.mode = TURN_MODE_HAZARD;
-    g_turn_state.direction = TURN_DIRECTION_NONE;
-    g_turn_state.blink_count = 0;
-    g_turn_state.output_state = true;
-    g_turn_state.last_toggle_time = system_state_get()->uptime_ms;
-    
-    set_turn_outputs(true, true);
-    update_system_state();
-    
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_hazard_off(void)
-{
-    if (g_turn_state.mode == TURN_MODE_HAZARD) {
-        return turn_signal_off();
-    }
-    return BCM_OK;
-}
-
-bcm_result_t turn_signal_hazard_toggle(void)
-{
-    if (g_turn_state.mode == TURN_MODE_HAZARD) {
-        return turn_signal_hazard_off();
-    } else {
-        return turn_signal_hazard_on();
-    }
-}
-
-bool turn_signal_hazard_active(void)
-{
-    return g_turn_state.mode == TURN_MODE_HAZARD;
-}
-
-/* =============================================================================
- * Lane Change Assist
- * ========================================================================== */
-
-bcm_result_t turn_signal_lane_change(turn_direction_t direction)
-{
-    if (direction == TURN_DIRECTION_NONE) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    g_turn_state.mode = TURN_MODE_LANE_CHANGE;
-    g_turn_state.direction = direction;
-    g_turn_state.blink_count = 0;
-    g_turn_state.output_state = true;
-    g_turn_state.last_toggle_time = system_state_get()->uptime_ms;
-    
-    bool left = (direction == TURN_DIRECTION_LEFT);
-    set_turn_outputs(left, !left);
-    update_system_state();
-    
-    return BCM_OK;
-}
-
-void turn_signal_set_lane_change_count(uint8_t count)
-{
-    g_turn_state.lane_change_blinks = count;
-}
-
-uint8_t turn_signal_get_lane_change_count(void)
-{
-    return g_turn_state.lane_change_blinks;
-}
-
-/* =============================================================================
- * Status Functions
- * ========================================================================== */
-
-turn_mode_t turn_signal_get_mode(void)
-{
-    return g_turn_state.mode;
-}
-
-bcm_result_t turn_signal_get_status(turn_signal_status_t *status)
-{
-    if (!status) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    *status = system_state_get()->turn_signal;
-    return BCM_OK;
-}
-
-bool turn_signal_is_illuminated(turn_direction_t direction)
-{
-    if (!g_turn_state.output_state) {
-        return false;
-    }
-    
-    if (g_turn_state.mode == TURN_MODE_HAZARD) {
-        return true;
-    }
-    
-    return g_turn_state.direction == direction;
-}
-
-uint8_t turn_signal_get_blink_count(void)
-{
-    return g_turn_state.blink_count;
-}
-
-/* =============================================================================
- * Bulb Monitoring
- * ========================================================================== */
-
-bool turn_signal_left_bulb_ok(void)
-{
-    return g_turn_state.left_bulb_ok;
-}
-
-bool turn_signal_right_bulb_ok(void)
-{
-    return g_turn_state.right_bulb_ok;
-}
-
-bool turn_signal_bulb_fault_present(void)
-{
-    return !g_turn_state.left_bulb_ok || !g_turn_state.right_bulb_ok;
-}
-
-void turn_signal_update_bulb_current(uint16_t left_ma, uint16_t right_ma)
-{
-    g_turn_state.left_bulb_current = left_ma;
-    g_turn_state.right_bulb_current = right_ma;
-}
-
-/* =============================================================================
- * Flash Rate Control
- * ========================================================================== */
-
-void turn_signal_set_flash_rate(uint16_t on_time_ms, uint16_t off_time_ms)
-{
-    g_turn_state.on_time_ms = on_time_ms;
-    g_turn_state.off_time_ms = off_time_ms;
-}
-
-void turn_signal_set_fast_flash(bool enable)
-{
-    g_turn_state.fast_flash_enabled = enable;
-}
-
-bool turn_signal_fast_flash_active(void)
-{
-    return g_turn_state.fast_flash_enabled;
-}
-
-/* =============================================================================
- * Steering Wheel Integration
- * ========================================================================== */
-
-void turn_signal_update_steering_angle(int16_t angle_deg)
-{
-    g_turn_state.steering_angle = angle_deg;
-}
-
-void turn_signal_auto_cancel_enable(bool enable)
-{
-    g_turn_state.auto_cancel_enabled = enable;
-}
-
-/* =============================================================================
- * CAN Message Handling
- * ========================================================================== */
-
-bcm_result_t turn_signal_handle_can_cmd(const uint8_t *data, uint8_t len)
-{
-    if (!data || len < 1) {
-        return BCM_ERROR_INVALID_PARAM;
-    }
-    
-    uint8_t cmd = data[0];
+    /* Process command */
+    uint8_t cmd = frame->data[TURN_CMD_BYTE_CMD];
+    turn_signal_mode_t old_mode = state->turn_signal.mode;
     
     switch (cmd) {
-        case TURN_CMD_LEFT_ON:
-            return turn_signal_left_on();
+        case TURN_CMD_OFF:
+            turn_signal_off();
+            break;
             
-        case TURN_CMD_LEFT_OFF:
-            return turn_signal_left_off();
+        case TURN_CMD_LEFT_ON:
+            turn_signal_left_on();
+            break;
             
         case TURN_CMD_RIGHT_ON:
-            return turn_signal_right_on();
-            
-        case TURN_CMD_RIGHT_OFF:
-            return turn_signal_right_off();
+            turn_signal_right_on();
+            break;
             
         case TURN_CMD_HAZARD_ON:
-            return turn_signal_hazard_on();
+            turn_signal_hazard_on();
+            break;
             
         case TURN_CMD_HAZARD_OFF:
-            return turn_signal_hazard_off();
-            
-        default:
-            return BCM_ERROR_INVALID_PARAM;
+            if (state->turn_signal.mode == TURN_SIG_STATE_HAZARD) {
+                turn_signal_off();
+            }
+            break;
+    }
+    
+    if (old_mode != state->turn_signal.mode) {
+        log_turn_event(old_mode, state->turn_signal.mode);
+    }
+    
+    state->turn_signal.last_cmd_time_ms = state->uptime_ms;
+    state->turn_signal.last_result = CMD_RESULT_OK;
+    
+    uint8_t data[4] = { cmd, 0, 0, 0 };
+    event_log_add(EVENT_CMD_RECEIVED, data);
+    
+    return CMD_RESULT_OK;
+}
+
+void turn_signal_update(uint32_t current_ms)
+{
+    system_state_t *state = sys_state_get_mut();
+    
+    /* Nothing to do if off */
+    if (state->turn_signal.mode == TURN_SIG_STATE_OFF) {
+        state->turn_signal.left_output = false;
+        state->turn_signal.right_output = false;
+        return;
+    }
+    
+    /* Get flash timing */
+    uint16_t on_ms, off_ms;
+    get_flash_timing(state->turn_signal.mode, &on_ms, &off_ms);
+    
+    /* Determine if currently in ON or OFF phase */
+    bool currently_on = state->turn_signal.left_output || state->turn_signal.right_output;
+    uint16_t phase_duration = currently_on ? on_ms : off_ms;
+    
+    /* Check if time to toggle */
+    uint32_t elapsed = current_ms - state->turn_signal.last_toggle_ms;
+    if (elapsed >= phase_duration) {
+        /* Toggle */
+        currently_on = !currently_on;
+        state->turn_signal.last_toggle_ms = current_ms;
+        
+        /* Update outputs based on mode */
+        switch (state->turn_signal.mode) {
+            case TURN_SIG_STATE_LEFT:
+                state->turn_signal.left_output = currently_on;
+                state->turn_signal.right_output = false;
+                break;
+                
+            case TURN_SIG_STATE_RIGHT:
+                state->turn_signal.left_output = false;
+                state->turn_signal.right_output = currently_on;
+                break;
+                
+            case TURN_SIG_STATE_HAZARD:
+                state->turn_signal.left_output = currently_on;
+                state->turn_signal.right_output = currently_on;
+                break;
+                
+            default:
+                state->turn_signal.left_output = false;
+                state->turn_signal.right_output = false;
+                break;
+        }
+        
+        /* Increment flash count on rising edge */
+        if (currently_on) {
+            state->turn_signal.flash_count++;
+        }
     }
 }
 
-void turn_signal_get_can_status(uint8_t *data, uint8_t *len)
+void turn_signal_check_timeout(uint32_t current_ms)
 {
-    /* Byte 0: Mode and direction */
-    data[0] = (uint8_t)g_turn_state.mode;
-    data[0] |= (uint8_t)((uint8_t)g_turn_state.direction << 4);
+    system_state_t *state = sys_state_get_mut();
     
-    /* Byte 1: Output state and blink count */
-    data[1] = g_turn_state.output_state ? 0x01 : 0x00;
-    data[1] |= (uint8_t)(g_turn_state.blink_count << 1);
+    /* Only timeout for non-hazard signals */
+    if (state->turn_signal.mode == TURN_SIG_STATE_LEFT ||
+        state->turn_signal.mode == TURN_SIG_STATE_RIGHT) {
+        
+        if (state->turn_signal.last_cmd_time_ms > 0) {
+            uint32_t elapsed = current_ms - state->turn_signal.last_cmd_time_ms;
+            
+            if (elapsed > TURN_SIGNAL_TIMEOUT_MS) {
+                printf("[TURN] Timeout - auto off\n");
+                turn_signal_off();
+                fault_manager_set(FAULT_CODE_TIMEOUT);
+            }
+        }
+    }
+}
+
+void turn_signal_build_status_frame(can_frame_t *frame)
+{
+    const system_state_t *state = sys_state_get();
+    system_state_t *mut_state = sys_state_get_mut();
     
-    /* Byte 2: Bulb status */
-    data[2] = 0;
-    if (g_turn_state.left_bulb_ok) data[2] |= 0x01;
-    if (g_turn_state.right_bulb_ok) data[2] |= 0x02;
-    if (g_turn_state.fast_flash_enabled) data[2] |= 0x80;
+    memset(frame, 0, sizeof(can_frame_t));
+    frame->id = CAN_ID_TURN_SIGNAL_STATUS;
+    frame->dlc = TURN_SIGNAL_STATUS_DLC;
     
-    /* Bytes 3-7: Reserved */
-    data[3] = 0;
-    data[4] = 0;
-    data[5] = 0;
-    data[6] = 0;
-    data[7] = 0;
+    /* Byte 0: Turn signal state */
+    frame->data[TURN_STATUS_BYTE_STATE] = (uint8_t)state->turn_signal.mode;
     
-    *len = 8;
+    /* Byte 1: Output state */
+    uint8_t output = 0;
+    if (state->turn_signal.left_output) output |= TURN_OUTPUT_LEFT_BIT;
+    if (state->turn_signal.right_output) output |= TURN_OUTPUT_RIGHT_BIT;
+    frame->data[TURN_STATUS_BYTE_OUTPUT] = output;
+    
+    /* Byte 2: Flash count */
+    frame->data[TURN_STATUS_BYTE_FLASH_CNT] = state->turn_signal.flash_count;
+    
+    /* Byte 3: Last command result */
+    frame->data[TURN_STATUS_BYTE_RESULT] = (uint8_t)state->turn_signal.last_result;
+    
+    /* Byte 4: Version and counter */
+    frame->data[TURN_STATUS_BYTE_VER_CTR] = CAN_BUILD_VER_CTR(
+        CAN_SCHEMA_VERSION, mut_state->tx_counter_turn);
+    mut_state->tx_counter_turn = (mut_state->tx_counter_turn + 1) & CAN_COUNTER_MASK;
+    
+    /* Byte 5: Checksum */
+    frame->data[TURN_STATUS_BYTE_CHECKSUM] = can_calculate_checksum(
+        frame->data, TURN_SIGNAL_STATUS_DLC - 1);
+}
+
+turn_signal_mode_t turn_signal_get_mode(void)
+{
+    return sys_state_get()->turn_signal.mode;
+}
+
+void turn_signal_get_output_state(bool *left_on, bool *right_on)
+{
+    const system_state_t *state = sys_state_get();
+    
+    if (left_on != NULL) {
+        *left_on = state->turn_signal.left_output;
+    }
+    if (right_on != NULL) {
+        *right_on = state->turn_signal.right_output;
+    }
+}
+
+uint8_t turn_signal_get_flash_count(void)
+{
+    return sys_state_get()->turn_signal.flash_count;
+}
+
+void turn_signal_off(void)
+{
+    system_state_t *state = sys_state_get_mut();
+    
+    if (state->turn_signal.mode != TURN_SIG_STATE_OFF) {
+        printf("[TURN] OFF\n");
+    }
+    
+    state->turn_signal.mode = TURN_SIG_STATE_OFF;
+    state->turn_signal.left_output = false;
+    state->turn_signal.right_output = false;
+    state->turn_signal.flash_count = 0;
+}
+
+void turn_signal_left_on(void)
+{
+    system_state_t *state = sys_state_get_mut();
+    
+    state->turn_signal.mode = TURN_SIG_STATE_LEFT;
+    state->turn_signal.left_output = true;
+    state->turn_signal.right_output = false;
+    state->turn_signal.flash_count = 0;
+    state->turn_signal.last_toggle_ms = state->uptime_ms;
+    
+    printf("[TURN] LEFT ON\n");
+}
+
+void turn_signal_right_on(void)
+{
+    system_state_t *state = sys_state_get_mut();
+    
+    state->turn_signal.mode = TURN_SIG_STATE_RIGHT;
+    state->turn_signal.left_output = false;
+    state->turn_signal.right_output = true;
+    state->turn_signal.flash_count = 0;
+    state->turn_signal.last_toggle_ms = state->uptime_ms;
+    
+    printf("[TURN] RIGHT ON\n");
+}
+
+void turn_signal_hazard_on(void)
+{
+    system_state_t *state = sys_state_get_mut();
+    
+    state->turn_signal.mode = TURN_SIG_STATE_HAZARD;
+    state->turn_signal.left_output = true;
+    state->turn_signal.right_output = true;
+    state->turn_signal.flash_count = 0;
+    state->turn_signal.last_toggle_ms = state->uptime_ms;
+    
+    printf("[TURN] HAZARD ON\n");
 }

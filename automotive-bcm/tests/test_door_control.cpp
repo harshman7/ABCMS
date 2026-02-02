@@ -2,402 +2,373 @@
  * @file test_door_control.cpp
  * @brief Unit tests for Door Control Module
  *
- * Tests for door lock, window control, and related functionality.
+ * Tests:
+ * - Lock/unlock commands
+ * - Invalid payload rejection
+ * - Checksum validation
+ * - Rolling counter validation
+ * - State machine transitions
  */
 
 #include "CppUTest/TestHarness.h"
-#include "CppUTestExt/MockSupport.h"
 
 extern "C" {
 #include "door_control.h"
-#include "system_state.h"
-#include "bcm_config.h"
+#include "fault_manager.h"
+#include "can_interface.h"
+#include "can_ids.h"
 }
 
-/* =============================================================================
+/*******************************************************************************
+ * Helper Functions
+ ******************************************************************************/
+
+static can_frame_t build_door_cmd(uint8_t cmd, uint8_t door_id, uint8_t counter)
+{
+    can_frame_t frame;
+    frame.id = CAN_ID_DOOR_CMD;
+    frame.dlc = DOOR_CMD_DLC;
+    
+    frame.data[DOOR_CMD_BYTE_CMD] = cmd;
+    frame.data[DOOR_CMD_BYTE_DOOR_ID] = door_id;
+    frame.data[DOOR_CMD_BYTE_VER_CTR] = CAN_BUILD_VER_CTR(CAN_SCHEMA_VERSION, counter);
+    frame.data[DOOR_CMD_BYTE_CHECKSUM] = can_calculate_checksum(frame.data, DOOR_CMD_DLC - 1);
+    
+    return frame;
+}
+
+/*******************************************************************************
  * Test Group: Door Control Initialization
- * ========================================================================== */
+ ******************************************************************************/
 
-TEST_GROUP(DoorControlInit)
+TEST_GROUP(DoorInit)
 {
     void setup() override
     {
-        system_state_init();
-    }
-
-    void teardown() override
-    {
-        door_control_deinit();
-        mock().clear();
-    }
-};
-
-TEST(DoorControlInit, InitializesSuccessfully)
-{
-    bcm_result_t result = door_control_init();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(DoorControlInit, CanBeDeinitialized)
-{
-    door_control_init();
-    door_control_deinit();
-    /* Should not crash */
-}
-
-TEST(DoorControlInit, DoubleInitIsOk)
-{
-    CHECK_EQUAL(BCM_OK, door_control_init());
-    CHECK_EQUAL(BCM_OK, door_control_init());
-}
-
-/* =============================================================================
- * Test Group: Door Lock Control
- * ========================================================================== */
-
-TEST_GROUP(DoorLockControl)
-{
-    void setup() override
-    {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         door_control_init();
     }
 
     void teardown() override
     {
-        door_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(DoorLockControl, LockAllDoorsSucceeds)
+TEST(DoorInit, AllDoorsUnlockedInitially)
 {
-    bcm_result_t result = door_lock_all();
-    CHECK_EQUAL(BCM_OK, result);
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(i));
+    }
 }
 
-TEST(DoorLockControl, UnlockAllDoorsSucceeds)
+TEST(DoorInit, NotAllLockedInitially)
 {
-    bcm_result_t result = door_unlock_all();
-    CHECK_EQUAL(BCM_OK, result);
+    CHECK_FALSE(door_control_all_locked());
 }
 
-TEST(DoorLockControl, LockSingleDoorSucceeds)
-{
-    bcm_result_t result = door_lock(DOOR_FRONT_LEFT);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(LOCK_STATE_LOCKED, door_get_lock_state(DOOR_FRONT_LEFT));
-}
+/*******************************************************************************
+ * Test Group: Door Lock Commands
+ ******************************************************************************/
 
-TEST(DoorLockControl, UnlockSingleDoorSucceeds)
+TEST_GROUP(DoorLockCommands)
 {
-    door_lock(DOOR_FRONT_RIGHT);
-    bcm_result_t result = door_unlock(DOOR_FRONT_RIGHT);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(LOCK_STATE_UNLOCKED, door_get_lock_state(DOOR_FRONT_RIGHT));
-}
+    void setup() override
+    {
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
+        door_control_init();
+    }
 
-TEST(DoorLockControl, LockAllSetsAllDoorsLocked)
+    void teardown() override
+    {
+        can_deinit();
+    }
+};
+
+TEST(DoorLockCommands, LockAllSucceeds)
 {
-    door_lock_all();
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 0);
     
-    CHECK_EQUAL(LOCK_STATE_LOCKED, door_get_lock_state(DOOR_FRONT_LEFT));
-    CHECK_EQUAL(LOCK_STATE_LOCKED, door_get_lock_state(DOOR_FRONT_RIGHT));
-    CHECK_EQUAL(LOCK_STATE_LOCKED, door_get_lock_state(DOOR_REAR_LEFT));
-    CHECK_EQUAL(LOCK_STATE_LOCKED, door_get_lock_state(DOOR_REAR_RIGHT));
-}
-
-TEST(DoorLockControl, UnlockAllSetsAllDoorsUnlocked)
-{
-    door_lock_all();
-    door_unlock_all();
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
     
-    CHECK_EQUAL(LOCK_STATE_UNLOCKED, door_get_lock_state(DOOR_FRONT_LEFT));
-    CHECK_EQUAL(LOCK_STATE_UNLOCKED, door_get_lock_state(DOOR_FRONT_RIGHT));
-    CHECK_EQUAL(LOCK_STATE_UNLOCKED, door_get_lock_state(DOOR_REAR_LEFT));
-    CHECK_EQUAL(LOCK_STATE_UNLOCKED, door_get_lock_state(DOOR_REAR_RIGHT));
+    /* State should be LOCKING */
+    for (uint8_t i = 0; i < NUM_DOORS; i++) {
+        CHECK_EQUAL(DOOR_STATE_LOCKING, door_control_get_lock_state(i));
+    }
+    
+    /* After update, should be LOCKED */
+    door_control_update(100);
+    CHECK_TRUE(door_control_all_locked());
 }
 
-TEST(DoorLockControl, AllLockedReturnsTrueWhenAllLocked)
+TEST(DoorLockCommands, UnlockAllSucceeds)
 {
-    door_lock_all();
-    CHECK_TRUE(door_all_locked());
+    /* First lock all */
+    door_control_lock_all();
+    door_control_update(100);
+    CHECK_TRUE(door_control_all_locked());
+    
+    /* Then unlock */
+    can_frame_t frame = build_door_cmd(DOOR_CMD_UNLOCK_ALL, DOOR_ID_ALL, 0);
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    
+    door_control_update(200);
+    CHECK_FALSE(door_control_all_locked());
 }
 
-TEST(DoorLockControl, AllLockedReturnsFalseWhenOneUnlocked)
+TEST(DoorLockCommands, LockSingleDoor)
 {
-    door_lock_all();
-    door_unlock(DOOR_FRONT_LEFT);
-    CHECK_FALSE(door_all_locked());
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_SINGLE, DOOR_ID_FRONT_LEFT, 0);
+    
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    
+    door_control_update(100);
+    
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(DOOR_ID_FRONT_LEFT));
+    CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(DOOR_ID_FRONT_RIGHT));
 }
 
-TEST(DoorLockControl, AnyUnlockedReturnsTrueWhenOneUnlocked)
+TEST(DoorLockCommands, UnlockSingleDoor)
 {
-    door_lock_all();
-    door_unlock(DOOR_REAR_RIGHT);
-    CHECK_TRUE(door_any_unlocked());
+    /* Lock all first */
+    door_control_lock_all();
+    door_control_update(100);
+    
+    /* Unlock single door */
+    can_frame_t frame = build_door_cmd(DOOR_CMD_UNLOCK_SINGLE, DOOR_ID_REAR_RIGHT, 1);
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    
+    door_control_update(200);
+    
+    CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(DOOR_ID_REAR_RIGHT));
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(DOOR_ID_FRONT_LEFT));
 }
 
-TEST(DoorLockControl, AnyUnlockedReturnsFalseWhenAllLocked)
-{
-    door_lock_all();
-    CHECK_FALSE(door_any_unlocked());
-}
+/*******************************************************************************
+ * Test Group: Door Command Validation
+ ******************************************************************************/
 
-TEST(DoorLockControl, InvalidDoorReturnsUnknownState)
-{
-    CHECK_EQUAL(LOCK_STATE_UNKNOWN, door_get_lock_state((door_position_t)99));
-}
-
-/* =============================================================================
- * Test Group: Window Control
- * ========================================================================== */
-
-TEST_GROUP(WindowControl)
+TEST_GROUP(DoorCommandValidation)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         door_control_init();
     }
 
     void teardown() override
     {
-        door_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(WindowControl, OpenWindowSucceeds)
+TEST(DoorCommandValidation, RejectsWrongDLC)
 {
-    bcm_result_t result = door_window_open(DOOR_FRONT_LEFT, false);
-    CHECK_EQUAL(BCM_OK, result);
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 0);
+    frame.dlc = 3; /* Wrong length */
+    
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
+    CHECK_TRUE(fault_manager_is_active(FAULT_CODE_INVALID_LENGTH));
 }
 
-TEST(WindowControl, CloseWindowSucceeds)
+TEST(DoorCommandValidation, RejectsInvalidChecksum)
 {
-    bcm_result_t result = door_window_close(DOOR_FRONT_LEFT, false);
-    CHECK_EQUAL(BCM_OK, result);
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 0);
+    frame.data[DOOR_CMD_BYTE_CHECKSUM] = 0xFF; /* Bad checksum */
+    
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_CHECKSUM_ERROR, result);
+    CHECK_TRUE(fault_manager_is_active(FAULT_CODE_INVALID_CHECKSUM));
 }
 
-TEST(WindowControl, StopWindowSucceeds)
+TEST(DoorCommandValidation, RejectsInvalidCounter)
 {
-    door_window_open(DOOR_FRONT_LEFT, false);
-    bcm_result_t result = door_window_stop(DOOR_FRONT_LEFT);
-    CHECK_EQUAL(BCM_OK, result);
+    /* First valid command */
+    can_frame_t frame1 = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 5);
+    cmd_result_t result1 = door_control_handle_cmd(&frame1);
+    CHECK_EQUAL(CMD_RESULT_OK, result1);
+    
+    /* Second command with wrong counter (should be 6, not 7) */
+    can_frame_t frame2 = build_door_cmd(DOOR_CMD_UNLOCK_ALL, DOOR_ID_ALL, 7);
+    cmd_result_t result2 = door_control_handle_cmd(&frame2);
+    CHECK_EQUAL(CMD_RESULT_COUNTER_ERROR, result2);
+    CHECK_TRUE(fault_manager_is_active(FAULT_CODE_INVALID_COUNTER));
 }
 
-TEST(WindowControl, InvalidDoorReturnsError)
+TEST(DoorCommandValidation, AcceptsWrappingCounter)
 {
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, door_window_open((door_position_t)99, false));
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, door_window_close((door_position_t)99, false));
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, door_window_stop((door_position_t)99));
+    /* Command with counter 15 */
+    can_frame_t frame1 = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 15);
+    cmd_result_t result1 = door_control_handle_cmd(&frame1);
+    CHECK_EQUAL(CMD_RESULT_OK, result1);
+    
+    /* Next command should have counter 0 (wrap) */
+    can_frame_t frame2 = build_door_cmd(DOOR_CMD_UNLOCK_ALL, DOOR_ID_ALL, 0);
+    cmd_result_t result2 = door_control_handle_cmd(&frame2);
+    CHECK_EQUAL(CMD_RESULT_OK, result2);
 }
 
-TEST(WindowControl, GetPositionReturnsValidValue)
+TEST(DoorCommandValidation, RejectsInvalidCommand)
 {
-    uint8_t pos = door_window_get_position(DOOR_FRONT_LEFT);
-    CHECK_TRUE(pos <= 100 || pos == 0xFF);
+    can_frame_t frame = build_door_cmd(0xFF, DOOR_ID_ALL, 0);
+    
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(WindowControl, InvalidDoorPositionReturns0xFF)
+TEST(DoorCommandValidation, RejectsInvalidDoorId)
 {
-    CHECK_EQUAL(0xFF, door_window_get_position((door_position_t)99));
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_SINGLE, 0x10, 0);
+    
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(WindowControl, CloseAllWindowsSucceeds)
+TEST(DoorCommandValidation, RejectsNullFrame)
 {
-    bcm_result_t result = door_window_close_all();
-    CHECK_EQUAL(BCM_OK, result);
+    cmd_result_t result = door_control_handle_cmd(NULL);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(WindowControl, SetPositionSucceeds)
+TEST(DoorCommandValidation, RejectsWrongCanId)
 {
-    bcm_result_t result = door_window_set_position(DOOR_FRONT_LEFT, 50);
-    CHECK_EQUAL(BCM_OK, result);
+    can_frame_t frame = build_door_cmd(DOOR_CMD_LOCK_ALL, DOOR_ID_ALL, 0);
+    frame.id = 0x999; /* Wrong ID */
+    
+    cmd_result_t result = door_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(WindowControl, SetPositionInvalidPercentageReturnsError)
-{
-    bcm_result_t result = door_window_set_position(DOOR_FRONT_LEFT, 150);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
+/*******************************************************************************
+ * Test Group: Door State Machine Transitions
+ ******************************************************************************/
 
-/* =============================================================================
- * Test Group: Child Safety Lock
- * ========================================================================== */
-
-TEST_GROUP(ChildSafetyLock)
+TEST_GROUP(DoorStateMachine)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         door_control_init();
     }
 
     void teardown() override
     {
-        door_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(ChildSafetyLock, EnableOnRearDoorSucceeds)
+TEST(DoorStateMachine, UnlockedToLockingToLocked)
 {
-    CHECK_EQUAL(BCM_OK, door_child_lock_enable(DOOR_REAR_LEFT));
-    CHECK_TRUE(door_child_lock_active(DOOR_REAR_LEFT));
+    CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(0));
+    
+    door_control_lock(0);
+    CHECK_EQUAL(DOOR_STATE_LOCKING, door_control_get_lock_state(0));
+    
+    door_control_update(100);
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(0));
 }
 
-TEST(ChildSafetyLock, DisableOnRearDoorSucceeds)
+TEST(DoorStateMachine, LockedToUnlockingToUnlocked)
 {
-    door_child_lock_enable(DOOR_REAR_RIGHT);
-    CHECK_EQUAL(BCM_OK, door_child_lock_disable(DOOR_REAR_RIGHT));
-    CHECK_FALSE(door_child_lock_active(DOOR_REAR_RIGHT));
+    door_control_lock(0);
+    door_control_update(100);
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(0));
+    
+    door_control_unlock(0);
+    CHECK_EQUAL(DOOR_STATE_UNLOCKING, door_control_get_lock_state(0));
+    
+    door_control_update(200);
+    CHECK_EQUAL(DOOR_STATE_UNLOCKED, door_control_get_lock_state(0));
 }
 
-TEST(ChildSafetyLock, EnableOnFrontDoorFails)
+TEST(DoorStateMachine, LockingAlreadyLockedNoChange)
 {
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, door_child_lock_enable(DOOR_FRONT_LEFT));
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, door_child_lock_enable(DOOR_FRONT_RIGHT));
+    door_control_lock(0);
+    door_control_update(100);
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(0));
+    
+    /* Try to lock again */
+    door_control_lock(0);
+    CHECK_EQUAL(DOOR_STATE_LOCKED, door_control_get_lock_state(0));
 }
 
-TEST(ChildSafetyLock, InvalidDoorReturnsFalse)
-{
-    CHECK_FALSE(door_child_lock_active((door_position_t)99));
-}
+/*******************************************************************************
+ * Test Group: Door Status Frame
+ ******************************************************************************/
 
-/* =============================================================================
- * Test Group: Auto-Lock Feature
- * ========================================================================== */
-
-TEST_GROUP(AutoLockFeature)
+TEST_GROUP(DoorStatusFrame)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         door_control_init();
     }
 
     void teardown() override
     {
-        door_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(AutoLockFeature, IsEnabledByDefault)
+TEST(DoorStatusFrame, HasCorrectId)
 {
-    CHECK_TRUE(door_auto_lock_enabled());
+    can_frame_t frame;
+    door_control_build_status_frame(&frame);
+    CHECK_EQUAL(CAN_ID_DOOR_STATUS, frame.id);
 }
 
-TEST(AutoLockFeature, CanBeDisabled)
+TEST(DoorStatusFrame, HasCorrectDlc)
 {
-    door_auto_lock_enable(false);
-    CHECK_FALSE(door_auto_lock_enabled());
+    can_frame_t frame;
+    door_control_build_status_frame(&frame);
+    CHECK_EQUAL(DOOR_STATUS_DLC, frame.dlc);
 }
 
-TEST(AutoLockFeature, CanBeReEnabled)
+TEST(DoorStatusFrame, LockBitsCorrect)
 {
-    door_auto_lock_enable(false);
-    door_auto_lock_enable(true);
-    CHECK_TRUE(door_auto_lock_enabled());
+    door_control_lock(DOOR_ID_FRONT_LEFT);
+    door_control_lock(DOOR_ID_REAR_RIGHT);
+    door_control_update(100);
+    
+    can_frame_t frame;
+    door_control_build_status_frame(&frame);
+    
+    CHECK_EQUAL(DOOR_LOCK_BIT_FL | DOOR_LOCK_BIT_RR, frame.data[DOOR_STATUS_BYTE_LOCKS]);
 }
 
-/* =============================================================================
- * Test Group: Door Status
- * ========================================================================== */
-
-TEST_GROUP(DoorStatus)
+TEST(DoorStatusFrame, ChecksumValid)
 {
-    void setup() override
-    {
-        system_state_init();
-        door_control_init();
-    }
-
-    void teardown() override
-    {
-        door_control_deinit();
-        mock().clear();
-    }
-};
-
-TEST(DoorStatus, GetStatusSucceeds)
-{
-    door_status_t status;
-    bcm_result_t result = door_get_status(DOOR_FRONT_LEFT, &status);
-    CHECK_EQUAL(BCM_OK, result);
+    can_frame_t frame;
+    door_control_build_status_frame(&frame);
+    
+    uint8_t calc = can_calculate_checksum(frame.data, DOOR_STATUS_DLC - 1);
+    CHECK_EQUAL(calc, frame.data[DOOR_STATUS_BYTE_CHECKSUM]);
 }
 
-TEST(DoorStatus, GetStatusWithNullPointerFails)
+TEST(DoorStatusFrame, CounterIncrements)
 {
-    bcm_result_t result = door_get_status(DOOR_FRONT_LEFT, nullptr);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
+    can_frame_t frame1, frame2;
+    
+    door_control_build_status_frame(&frame1);
+    uint8_t counter1 = CAN_GET_COUNTER(frame1.data[DOOR_STATUS_BYTE_VER_CTR]);
+    
+    door_control_build_status_frame(&frame2);
+    uint8_t counter2 = CAN_GET_COUNTER(frame2.data[DOOR_STATUS_BYTE_VER_CTR]);
+    
+    CHECK_EQUAL((counter1 + 1) & CAN_COUNTER_MASK, counter2);
 }
-
-TEST(DoorStatus, InvalidDoorReturnsFalse)
-{
-    CHECK_FALSE(door_is_open((door_position_t)99));
-}
-
-/* =============================================================================
- * Test Group: CAN Message Handling
- * ========================================================================== */
-
-TEST_GROUP(DoorCanMessages)
-{
-    void setup() override
-    {
-        system_state_init();
-        door_control_init();
-    }
-
-    void teardown() override
-    {
-        door_control_deinit();
-        mock().clear();
-    }
-};
-
-TEST(DoorCanMessages, HandleLockAllCommand)
-{
-    uint8_t data[] = {0x01};  /* DOOR_CMD_LOCK_ALL */
-    bcm_result_t result = door_control_handle_can_cmd(data, sizeof(data));
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_TRUE(door_all_locked());
-}
-
-TEST(DoorCanMessages, HandleUnlockAllCommand)
-{
-    door_lock_all();
-    uint8_t data[] = {0x02};  /* DOOR_CMD_UNLOCK_ALL */
-    bcm_result_t result = door_control_handle_can_cmd(data, sizeof(data));
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(DoorCanMessages, HandleNullDataFails)
-{
-    bcm_result_t result = door_control_handle_can_cmd(nullptr, 0);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(DoorCanMessages, HandleInvalidCommandFails)
-{
-    uint8_t data[] = {0xFF};
-    bcm_result_t result = door_control_handle_can_cmd(data, sizeof(data));
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(DoorCanMessages, GetCanStatusFillsBuffer)
-{
-    uint8_t data[8] = {0};
-    uint8_t len = 0;
-    door_control_get_can_status(data, &len);
-    CHECK_EQUAL(8, len);
-}
-
-/* =============================================================================
- * CppUTest Main - Run Door Control Tests
- * ========================================================================== */
-
-/* Note: Main is provided in a separate file or by CppUTest */

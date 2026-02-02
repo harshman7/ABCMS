@@ -1,0 +1,11 @@
+/**
+ * @file test_main.cpp
+ * @brief CppUTest main entry point
+ */
+
+#include "CppUTest/CommandLineTestRunner.h"
+
+int main(int argc, char** argv)
+{
+    return CommandLineTestRunner::RunAllTests(argc, argv);
+}

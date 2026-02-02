@@ -2,461 +2,353 @@
  * @file test_lighting_control.cpp
  * @brief Unit tests for Lighting Control Module
  *
- * Tests for headlights, interior lights, and automatic features.
+ * Tests:
+ * - Off/On/Auto mode transitions
+ * - Invalid mode rejection
+ * - High beam control
+ * - Interior light control
  */
 
 #include "CppUTest/TestHarness.h"
-#include "CppUTestExt/MockSupport.h"
 
 extern "C" {
 #include "lighting_control.h"
-#include "system_state.h"
-#include "bcm_config.h"
+#include "fault_manager.h"
+#include "can_interface.h"
+#include "can_ids.h"
 }
 
-/* =============================================================================
- * Test Group: Lighting Control Initialization
- * ========================================================================== */
+/*******************************************************************************
+ * Helper Functions
+ ******************************************************************************/
 
-TEST_GROUP(LightingControlInit)
+static can_frame_t build_lighting_cmd(uint8_t headlight, uint8_t interior, uint8_t counter)
+{
+    can_frame_t frame;
+    frame.id = CAN_ID_LIGHTING_CMD;
+    frame.dlc = LIGHTING_CMD_DLC;
+    
+    frame.data[LIGHTING_CMD_BYTE_HEADLIGHT] = headlight;
+    frame.data[LIGHTING_CMD_BYTE_INTERIOR] = interior;
+    frame.data[LIGHTING_CMD_BYTE_VER_CTR] = CAN_BUILD_VER_CTR(CAN_SCHEMA_VERSION, counter);
+    frame.data[LIGHTING_CMD_BYTE_CHECKSUM] = can_calculate_checksum(frame.data, LIGHTING_CMD_DLC - 1);
+    
+    return frame;
+}
+
+/*******************************************************************************
+ * Test Group: Lighting Initialization
+ ******************************************************************************/
+
+TEST_GROUP(LightingInit)
 {
     void setup() override
     {
-        system_state_init();
-    }
-
-    void teardown() override
-    {
-        lighting_control_deinit();
-        mock().clear();
-    }
-};
-
-TEST(LightingControlInit, InitializesSuccessfully)
-{
-    bcm_result_t result = lighting_control_init();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(LightingControlInit, CanBeDeinitialized)
-{
-    lighting_control_init();
-    lighting_control_deinit();
-    /* Should not crash */
-}
-
-TEST(LightingControlInit, HeadlightsOffByDefault)
-{
-    lighting_control_init();
-    CHECK_FALSE(lighting_headlights_active());
-}
-
-/* =============================================================================
- * Test Group: Headlight Control
- * ========================================================================== */
-
-TEST_GROUP(HeadlightControl)
-{
-    void setup() override
-    {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         lighting_control_init();
     }
 
     void teardown() override
     {
-        lighting_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(HeadlightControl, TurnOnSucceeds)
+TEST(LightingInit, HeadlightOffInitially)
 {
-    bcm_result_t result = lighting_headlights_on();
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_TRUE(lighting_headlights_active());
+    CHECK_EQUAL(LIGHTING_STATE_OFF, lighting_control_get_headlight_mode());
+    CHECK_EQUAL(HEADLIGHT_STATE_OFF, lighting_control_get_headlight_output());
 }
 
-TEST(HeadlightControl, TurnOffSucceeds)
+TEST(LightingInit, InteriorOffInitially)
 {
-    lighting_headlights_on();
-    bcm_result_t result = lighting_headlights_off();
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_FALSE(lighting_headlights_active());
+    CHECK_EQUAL(0, lighting_control_get_interior_brightness());
 }
 
-TEST(HeadlightControl, SetModeOffSucceeds)
+TEST(LightingInit, HeadlightsNotOnInitially)
 {
-    lighting_headlights_on();
-    bcm_result_t result = lighting_set_headlight_mode(HEADLIGHT_MODE_OFF);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(HEADLIGHT_MODE_OFF, lighting_get_headlight_mode());
+    CHECK_FALSE(lighting_control_headlights_on());
 }
 
-TEST(HeadlightControl, SetModeLowBeamSucceeds)
-{
-    bcm_result_t result = lighting_set_headlight_mode(HEADLIGHT_MODE_LOW_BEAM);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(HEADLIGHT_MODE_LOW_BEAM, lighting_get_headlight_mode());
-}
+/*******************************************************************************
+ * Test Group: Headlight Mode Commands
+ ******************************************************************************/
 
-TEST(HeadlightControl, SetModeAutoSucceeds)
-{
-    bcm_result_t result = lighting_set_headlight_mode(HEADLIGHT_MODE_AUTO);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(HEADLIGHT_MODE_AUTO, lighting_get_headlight_mode());
-}
-
-TEST(HeadlightControl, GetModeReturnsCurrentMode)
-{
-    lighting_set_headlight_mode(HEADLIGHT_MODE_HIGH_BEAM);
-    CHECK_EQUAL(HEADLIGHT_MODE_HIGH_BEAM, lighting_get_headlight_mode());
-}
-
-/* =============================================================================
- * Test Group: High Beam Control
- * ========================================================================== */
-
-TEST_GROUP(HighBeamControl)
+TEST_GROUP(HeadlightModes)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         lighting_control_init();
     }
 
     void teardown() override
     {
-        lighting_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(HighBeamControl, TurnOnWithHeadlightsSucceeds)
+TEST(HeadlightModes, TurnOnSucceeds)
 {
-    lighting_headlights_on();
-    bcm_result_t result = lighting_high_beam_on();
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_TRUE(lighting_high_beam_active());
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_ON, INTERIOR_CMD_OFF, 0);
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(LIGHTING_STATE_ON, lighting_control_get_headlight_mode());
+    CHECK_TRUE(lighting_control_headlights_on());
 }
 
-TEST(HighBeamControl, TurnOnWithoutHeadlightsFails)
+TEST(HeadlightModes, TurnOffSucceeds)
 {
-    bcm_result_t result = lighting_high_beam_on();
-    CHECK_EQUAL(BCM_ERROR_NOT_READY, result);
+    /* Turn on first */
+    lighting_control_set_headlight_mode(LIGHTING_STATE_ON);
+    CHECK_TRUE(lighting_control_headlights_on());
+    
+    /* Turn off */
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_OFF, INTERIOR_CMD_OFF, 0);
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(LIGHTING_STATE_OFF, lighting_control_get_headlight_mode());
+    CHECK_FALSE(lighting_control_headlights_on());
 }
 
-TEST(HighBeamControl, TurnOffSucceeds)
+TEST(HeadlightModes, AutoModeSucceeds)
 {
-    lighting_headlights_on();
-    lighting_high_beam_on();
-    bcm_result_t result = lighting_high_beam_off();
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_FALSE(lighting_high_beam_active());
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_AUTO, INTERIOR_CMD_OFF, 0);
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(LIGHTING_STATE_AUTO, lighting_control_get_headlight_mode());
 }
 
-TEST(HighBeamControl, FlashSucceeds)
+TEST(HeadlightModes, HighBeamOnSucceeds)
 {
-    lighting_headlights_on();
-    bcm_result_t result = lighting_flash_high_beam();
-    CHECK_EQUAL(BCM_OK, result);
+    /* Turn on low beam first */
+    lighting_control_set_headlight_mode(LIGHTING_STATE_ON);
+    
+    /* Turn on high beam */
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_HIGH_ON, INTERIOR_CMD_OFF, 0);
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(HEADLIGHT_STATE_HIGH_BEAM, lighting_control_get_headlight_output());
 }
 
-/* =============================================================================
- * Test Group: Fog Light Control
- * ========================================================================== */
+TEST(HeadlightModes, HighBeamOffSucceeds)
+{
+    lighting_control_set_headlight_mode(LIGHTING_STATE_ON);
+    lighting_control_set_high_beam(true);
+    CHECK_EQUAL(HEADLIGHT_STATE_HIGH_BEAM, lighting_control_get_headlight_output());
+    
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_HIGH_OFF, INTERIOR_CMD_OFF, 0);
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(HEADLIGHT_STATE_ON, lighting_control_get_headlight_output());
+}
 
-TEST_GROUP(FogLightControl)
+/*******************************************************************************
+ * Test Group: Auto Mode Behavior
+ ******************************************************************************/
+
+TEST_GROUP(AutoModeBehavior)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         lighting_control_init();
     }
 
     void teardown() override
     {
-        lighting_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(FogLightControl, TurnOnSucceeds)
+TEST(AutoModeBehavior, TurnsOnWhenDark)
 {
-    bcm_result_t result = lighting_fog_lights_on();
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_TRUE(lighting_fog_lights_active());
+    lighting_control_set_headlight_mode(LIGHTING_STATE_AUTO);
+    lighting_control_set_ambient(50); /* Below threshold */
+    lighting_control_update(100);
+    
+    CHECK_EQUAL(HEADLIGHT_STATE_AUTO, lighting_control_get_headlight_output());
 }
 
-TEST(FogLightControl, TurnOffSucceeds)
+TEST(AutoModeBehavior, StaysOffWhenBright)
 {
-    lighting_fog_lights_on();
-    bcm_result_t result = lighting_fog_lights_off();
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_FALSE(lighting_fog_lights_active());
+    lighting_control_set_headlight_mode(LIGHTING_STATE_AUTO);
+    lighting_control_set_ambient(200); /* Above threshold */
+    lighting_control_update(100);
+    
+    CHECK_EQUAL(HEADLIGHT_STATE_OFF, lighting_control_get_headlight_output());
 }
 
-TEST(FogLightControl, RearFogOnSucceeds)
-{
-    bcm_result_t result = lighting_rear_fog_on();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-TEST(FogLightControl, RearFogOffSucceeds)
-{
-    bcm_result_t result = lighting_rear_fog_off();
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-/* =============================================================================
+/*******************************************************************************
  * Test Group: Interior Light Control
- * ========================================================================== */
+ ******************************************************************************/
 
-TEST_GROUP(InteriorLightControl)
+TEST_GROUP(InteriorControl)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         lighting_control_init();
     }
 
     void teardown() override
     {
-        lighting_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(InteriorLightControl, TurnOnSucceeds)
+TEST(InteriorControl, TurnOnWithBrightness)
 {
-    bcm_result_t result = lighting_interior_on();
-    CHECK_EQUAL(BCM_OK, result);
+    uint8_t brightness = 10;
+    uint8_t interior_byte = INTERIOR_CMD_ON | (brightness << 4);
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_OFF, interior_byte, 0);
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(brightness, lighting_control_get_interior_brightness());
 }
 
-TEST(InteriorLightControl, TurnOffSucceeds)
+TEST(InteriorControl, TurnOff)
 {
-    lighting_interior_on();
-    bcm_result_t result = lighting_interior_off();
-    CHECK_EQUAL(BCM_OK, result);
+    lighting_control_set_interior(LIGHTING_STATE_ON, 15);
+    CHECK_EQUAL(15, lighting_control_get_interior_brightness());
+    
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_OFF, INTERIOR_CMD_OFF, 0);
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    
+    CHECK_EQUAL(CMD_RESULT_OK, result);
+    CHECK_EQUAL(0, lighting_control_get_interior_brightness());
 }
 
-TEST(InteriorLightControl, SetBrightnessSucceeds)
-{
-    bcm_result_t result = lighting_interior_set_brightness(128);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(128, lighting_interior_get_brightness());
-}
+/*******************************************************************************
+ * Test Group: Lighting Command Validation
+ ******************************************************************************/
 
-TEST(InteriorLightControl, SetBrightnessZeroTurnsOff)
-{
-    lighting_interior_on();
-    lighting_interior_set_brightness(0);
-    CHECK_EQUAL(0, lighting_interior_get_brightness());
-}
-
-TEST(InteriorLightControl, SetBrightnessMaxTurnsOn)
-{
-    lighting_interior_set_brightness(255);
-    CHECK_EQUAL(255, lighting_interior_get_brightness());
-}
-
-TEST(InteriorLightControl, SetModeDoorSucceeds)
-{
-    bcm_result_t result = lighting_set_interior_mode(INTERIOR_MODE_DOOR);
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_EQUAL(INTERIOR_MODE_DOOR, lighting_get_interior_mode());
-}
-
-TEST(InteriorLightControl, FadeOutSucceeds)
-{
-    lighting_interior_on();
-    bcm_result_t result = lighting_interior_fade_out(2000);
-    CHECK_EQUAL(BCM_OK, result);
-}
-
-/* =============================================================================
- * Test Group: Automatic Features
- * ========================================================================== */
-
-TEST_GROUP(LightingAutoFeatures)
+TEST_GROUP(LightingValidation)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         lighting_control_init();
     }
 
     void teardown() override
     {
-        lighting_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(LightingAutoFeatures, AutoHeadlightsCanBeEnabled)
+TEST(LightingValidation, RejectsInvalidHeadlightMode)
 {
-    lighting_auto_headlights_enable(true);
-    CHECK_TRUE(lighting_auto_headlights_enabled());
+    can_frame_t frame = build_lighting_cmd(0xFF, INTERIOR_CMD_OFF, 0);
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(LightingAutoFeatures, AutoHeadlightsCanBeDisabled)
+TEST(LightingValidation, RejectsInvalidInteriorMode)
 {
-    lighting_auto_headlights_enable(false);
-    CHECK_FALSE(lighting_auto_headlights_enabled());
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_OFF, 0x0F, 0);
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(LightingAutoFeatures, FollowMeHomeNotSupportedWhenDisabled)
+TEST(LightingValidation, RejectsWrongDLC)
 {
-    lighting_follow_me_home_enable(false);
-    bcm_result_t result = lighting_trigger_follow_me_home();
-    CHECK_EQUAL(BCM_ERROR_NOT_SUPPORTED, result);
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_ON, INTERIOR_CMD_OFF, 0);
+    frame.dlc = 2;
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_INVALID_CMD, result);
 }
 
-TEST(LightingAutoFeatures, FollowMeHomeSucceedsWhenEnabled)
+TEST(LightingValidation, RejectsInvalidChecksum)
 {
-    lighting_follow_me_home_enable(true);
-    bcm_result_t result = lighting_trigger_follow_me_home();
-    CHECK_EQUAL(BCM_OK, result);
+    can_frame_t frame = build_lighting_cmd(HEADLIGHT_CMD_ON, INTERIOR_CMD_OFF, 0);
+    frame.data[LIGHTING_CMD_BYTE_CHECKSUM] = 0x00;
+    
+    cmd_result_t result = lighting_control_handle_cmd(&frame);
+    CHECK_EQUAL(CMD_RESULT_CHECKSUM_ERROR, result);
 }
 
-TEST(LightingAutoFeatures, WelcomeLightsNotSupportedWhenDisabled)
+TEST(LightingValidation, RejectsInvalidCounter)
 {
-    lighting_welcome_lights_enable(false);
-    bcm_result_t result = lighting_trigger_welcome_lights();
-    CHECK_EQUAL(BCM_ERROR_NOT_SUPPORTED, result);
+    /* First command */
+    can_frame_t frame1 = build_lighting_cmd(HEADLIGHT_CMD_ON, INTERIOR_CMD_OFF, 5);
+    lighting_control_handle_cmd(&frame1);
+    
+    /* Second with bad counter */
+    can_frame_t frame2 = build_lighting_cmd(HEADLIGHT_CMD_OFF, INTERIOR_CMD_OFF, 10);
+    cmd_result_t result = lighting_control_handle_cmd(&frame2);
+    
+    CHECK_EQUAL(CMD_RESULT_COUNTER_ERROR, result);
 }
 
-TEST(LightingAutoFeatures, WelcomeLightsSucceedsWhenEnabled)
-{
-    lighting_welcome_lights_enable(true);
-    bcm_result_t result = lighting_trigger_welcome_lights();
-    CHECK_EQUAL(BCM_OK, result);
-}
+/*******************************************************************************
+ * Test Group: Lighting Status Frame
+ ******************************************************************************/
 
-TEST(LightingAutoFeatures, AmbientLightCanBeUpdated)
-{
-    lighting_update_ambient_light(500);
-    /* No assertion - just verify it doesn't crash */
-}
-
-/* =============================================================================
- * Test Group: Lighting Status
- * ========================================================================== */
-
-TEST_GROUP(LightingStatus)
+TEST_GROUP(LightingStatusFrame)
 {
     void setup() override
     {
-        system_state_init();
+        sys_state_init();
+        can_init(NULL);
+        fault_manager_init();
         lighting_control_init();
     }
 
     void teardown() override
     {
-        lighting_control_deinit();
-        mock().clear();
+        can_deinit();
     }
 };
 
-TEST(LightingStatus, GetStatusSucceeds)
+TEST(LightingStatusFrame, HasCorrectId)
 {
-    lighting_status_t status;
-    bcm_result_t result = lighting_get_status(&status);
-    CHECK_EQUAL(BCM_OK, result);
+    can_frame_t frame;
+    lighting_control_build_status_frame(&frame);
+    CHECK_EQUAL(CAN_ID_LIGHTING_STATUS, frame.id);
 }
 
-TEST(LightingStatus, GetStatusWithNullPointerFails)
+TEST(LightingStatusFrame, HasCorrectDlc)
 {
-    bcm_result_t result = lighting_get_status(nullptr);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
+    can_frame_t frame;
+    lighting_control_build_status_frame(&frame);
+    CHECK_EQUAL(LIGHTING_STATUS_DLC, frame.dlc);
 }
 
-/* =============================================================================
- * Test Group: Door Events
- * ========================================================================== */
-
-TEST_GROUP(LightingDoorEvents)
+TEST(LightingStatusFrame, ChecksumValid)
 {
-    void setup() override
-    {
-        system_state_init();
-        lighting_control_init();
-        lighting_set_interior_mode(INTERIOR_MODE_DOOR);
-    }
-
-    void teardown() override
-    {
-        lighting_control_deinit();
-        mock().clear();
-    }
-};
-
-TEST(LightingDoorEvents, DoorOpenTriggersInteriorLight)
-{
-    lighting_on_door_open(DOOR_FRONT_LEFT);
-    /* Light should be on - implementation specific */
+    can_frame_t frame;
+    lighting_control_build_status_frame(&frame);
+    
+    uint8_t calc = can_calculate_checksum(frame.data, LIGHTING_STATUS_DLC - 1);
+    CHECK_EQUAL(calc, frame.data[LIGHTING_STATUS_BYTE_CHECKSUM]);
 }
 
-TEST(LightingDoorEvents, DoorCloseStartsFadeOut)
+TEST(LightingStatusFrame, HeadlightStateCorrect)
 {
-    lighting_on_door_open(DOOR_FRONT_LEFT);
-    lighting_on_door_close(DOOR_FRONT_LEFT);
-    /* Should start fade - implementation specific */
-}
-
-/* =============================================================================
- * Test Group: CAN Message Handling
- * ========================================================================== */
-
-TEST_GROUP(LightingCanMessages)
-{
-    void setup() override
-    {
-        system_state_init();
-        lighting_control_init();
-    }
-
-    void teardown() override
-    {
-        lighting_control_deinit();
-        mock().clear();
-    }
-};
-
-TEST(LightingCanMessages, HandleHeadlightsOnCommand)
-{
-    uint8_t data[] = {0x01};  /* LIGHT_CMD_HEADLIGHTS_ON */
-    bcm_result_t result = lighting_control_handle_can_cmd(data, sizeof(data));
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_TRUE(lighting_headlights_active());
-}
-
-TEST(LightingCanMessages, HandleHeadlightsOffCommand)
-{
-    lighting_headlights_on();
-    uint8_t data[] = {0x02};  /* LIGHT_CMD_HEADLIGHTS_OFF */
-    bcm_result_t result = lighting_control_handle_can_cmd(data, sizeof(data));
-    CHECK_EQUAL(BCM_OK, result);
-    CHECK_FALSE(lighting_headlights_active());
-}
-
-TEST(LightingCanMessages, HandleNullDataFails)
-{
-    bcm_result_t result = lighting_control_handle_can_cmd(nullptr, 0);
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(LightingCanMessages, HandleInvalidCommandFails)
-{
-    uint8_t data[] = {0xFF};
-    bcm_result_t result = lighting_control_handle_can_cmd(data, sizeof(data));
-    CHECK_EQUAL(BCM_ERROR_INVALID_PARAM, result);
-}
-
-TEST(LightingCanMessages, GetCanStatusFillsBuffer)
-{
-    uint8_t data[8] = {0};
-    uint8_t len = 0;
-    lighting_control_get_can_status(data, &len);
-    CHECK_EQUAL(8, len);
+    lighting_control_set_headlight_mode(LIGHTING_STATE_ON);
+    
+    can_frame_t frame;
+    lighting_control_build_status_frame(&frame);
+    
+    CHECK_EQUAL(HEADLIGHT_STATE_ON, frame.data[LIGHTING_STATUS_BYTE_HEADLIGHT]);
 }
